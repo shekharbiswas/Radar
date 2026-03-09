@@ -871,7 +871,7 @@ def main():
         st.markdown(
             '<h2 style="font-family:JetBrains Mono,monospace;color:#FFD700;'
             'font-size:clamp(14px,3vw,20px);margin:0;letter-spacing:1px">'
-            '⚡ Momentum Radar v2 — NSE</h2>',
+            '⚡ SB Momentum Radar </h2>',
             unsafe_allow_html=True,
         )
     tick    = st.session_state.tick
