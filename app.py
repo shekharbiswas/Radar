@@ -1,26 +1,4 @@
-"""
-Momentum Radar Live  
-═══════════════════════════════════════════════════════
-• All tick data moved to @st.cache_resource  →  ONE shared store for every
-  browser tab / user.  
 
-• Fetch gate  →  API called at most once per REFRESH_SEC regardless of how
-  many users are connected.  PC tab drives the loop; mobile users just read.
-
-• Spike log  →  two lists (all gate-passed + strong-buy-only) accumulated
-  from 09:15 IST, newest-on-top table at the bottom of the page.
-  Resets automatically at the start of each trading day.
-
-• Signal deduplication  →  each stock appended only on first appearance or
-  when signal upgrades (WATCH → STRONG BUY).  Never spams the same tick.
-
-DEPLOYMENT
-──────────
-• Keep ONE PC browser tab open 09:15–15:30 → drives the fetch loop.
-• Any other user (mobile / another PC) opening mid-day sees the full
-  day's spike history immediately.
-• No database, no file I/O, no background threads required.
-"""
 
 import streamlit as st
 import pandas as pd
@@ -210,6 +188,47 @@ function tickDown(){{
   setFlip(sEl,'s',pad(secs%60));
   secs--;
 }}
+/* ── Watch tick sound ── */
+let _tctx = null;
+function getTC(){{
+  if(!_tctx) _tctx = new (window.AudioContext||window.webkitAudioContext)();
+  return _tctx;
+}}
+let tickPhase = 0;  // alternates 0/1 for tick/tock
+function playTick(){{
+  try{{
+    const ctx  = getTC();
+    const buf  = ctx.createBuffer(1, ctx.sampleRate*0.02, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    // short sharp noise burst — different pitch each phase
+    const baseFreq = tickPhase === 0 ? 1800 : 1400;
+    for(let i=0;i<data.length;i++){{
+      // decaying sine click
+      const t = i/ctx.sampleRate;
+      data[i] = Math.sin(2*Math.PI*baseFreq*t) * Math.exp(-t*180) * 0.18;
+    }}
+    const src  = ctx.createBufferSource();
+    const gain = ctx.createGain();
+    src.buffer = buf;
+    src.connect(gain); gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(tickPhase===0 ? 0.22 : 0.14, ctx.currentTime);
+    src.start(ctx.currentTime);
+    tickPhase = 1 - tickPhase;
+  }}catch(e){{}}
+}}
+
+// Unlock audio on first user interaction, then start ticking
+let tickInterval = null;
+function startTicking(){{
+  if(tickInterval) return;
+  playTick();
+  tickInterval = setInterval(playTick, 1000);
+}}
+document.addEventListener('click',    startTicking, {{once:false}});
+document.addEventListener('touchstart',startTicking, {{once:false}});
+// Also try immediately in case context is already unlocked
+try{{ getTC(); if(_tctx.state==='running') startTicking(); }}catch(e){{}}
+
 tickDown(); setInterval(tickDown,1000);
 
 function updateIST(){{
@@ -1085,6 +1104,7 @@ def build_html(results, ts, tick, hof, warming):
         )
 
     strong_buy_json = json.dumps([r["sym"] for r in results if "STRONG BUY" in r["signal"]])
+    all_syms_json   = json.dumps([r["sym"] for r in results])   # all gate-passed this tick
     status_color = "#ff9800" if warming else "#00e676"
     status_text  = f"⏳ WARMING {tick}/{WARMUP_TICKS}" if warming else f"🟢 LIVE tick#{tick}"
 
@@ -1115,6 +1135,7 @@ td{{white-space:nowrap}}
 .t2cell{{background:#111120;border-radius:4px;padding:5px 7px;flex:1;text-align:center}}
 .gates{{display:flex;gap:5px;flex-wrap:wrap;padding:6px 0 8px}}
 .gate{{padding:3px 7px;border-radius:4px;font-size:10px;font-weight:700}}
+@keyframes toastIn{{from{{opacity:0;transform:translateX(-10px)}}to{{opacity:1;transform:translateX(0)}}}}
 @media(max-width:600px){{#tip{{display:none!important}}.tc-val{{font-size:13px}}thead th{{font-size:9px;padding:6px 5px}}}}
 </style></head><body>
 
@@ -1307,11 +1328,80 @@ const iv=setInterval(()=>{{
 }},1000);
 
 const SB={strong_buy_json};
+const ALL_SYMS={all_syms_json};
+
+/* ── Web Audio sound engine ── */
+let _actx = null;
+function getACtx(){{
+  if(!_actx) _actx = new (window.AudioContext||window.webkitAudioContext)();
+  return _actx;
+}}
+
+function playTone(freq=880, dur=0.18, vol=0.25, type='sine', fadeOut=true){{
+  try{{
+    const ctx  = getACtx();
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type      = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    if(fadeOut) gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+dur);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime+dur);
+  }}catch(e){{}}
+}}
+
+/* 
+  Two distinct sounds:
+  NEW STOCK on list  → soft double-chime (pleasant, not alarming)
+  STRONG BUY         → ascending three-note alert (more urgent)
+*/
+function soundNewStock(){{
+  playTone(660, 0.14, 0.18, 'sine');
+  setTimeout(()=>playTone(880, 0.18, 0.18, 'sine'), 140);
+}}
+
+function soundStrongBuy(){{
+  playTone(523, 0.12, 0.28, 'triangle');
+  setTimeout(()=>playTone(659, 0.12, 0.28, 'triangle'), 120);
+  setTimeout(()=>playTone(784, 0.22, 0.28, 'triangle'), 240);
+}}
+
+/* ── New stock detection ── */
+(function(){{
+  try{{
+    const prev    = JSON.parse(sessionStorage.getItem('prev_syms')||'[]');
+    const newSyms = ALL_SYMS.filter(s => !prev.includes(s));
+    if(newSyms.length && prev.length > 0){{   // skip very first load
+      soundNewStock();
+      // Show a subtle toast for each new stock
+      newSyms.forEach((sym, i) => {{
+        setTimeout(()=>{{
+          const toast = document.createElement('div');
+          toast.style.cssText = [
+            'position:fixed','bottom:'+(20+i*52)+'px','left:16px',
+            'z-index:99998','background:#0a1a0a',
+            'border:1px solid #00e67644','border-radius:8px',
+            'padding:8px 14px','font-family:monospace','font-size:12px',
+            'color:#69f0ae','box-shadow:0 4px 20px rgba(0,230,118,.12)',
+            'animation:toastIn .2s ease',
+          ].join(';');
+          toast.innerHTML = `⚡ <b>${{sym}}</b> <span style="color:#444">entered radar</span>`;
+          document.body.appendChild(toast);
+          setTimeout(()=>toast.remove(), 5000);
+        }}, i*80);
+      }});
+    }}
+    sessionStorage.setItem('prev_syms', JSON.stringify(ALL_SYMS));
+  }}catch(e){{}}
+}})();
 (function(){{
   try{{
     const seen=JSON.parse(sessionStorage.getItem('seen_sb')||'[]');
     const nw=SB.filter(s=>!seen.includes(s));
     if(nw.length){{
+      soundStrongBuy();
       sessionStorage.setItem('seen_sb',JSON.stringify([...new Set([...seen,...SB])]));
       const pop=document.createElement('div');
       pop.style.cssText='position:fixed;top:16px;right:16px;z-index:99999;background:#001a0a;border:2px solid #00e676;border-radius:10px;padding:14px 16px;min-width:200px;font-family:monospace;box-shadow:0 0 30px #00e67655;font-size:13px;color:#ddd';
