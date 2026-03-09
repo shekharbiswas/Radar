@@ -33,4 +33,4 @@
 
 ```
 
-check original repo for full product simulation
+check original repo for full product arch.
