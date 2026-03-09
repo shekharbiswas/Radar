@@ -1,7 +1,7 @@
 """
-⚡ SB Momentum Radar Live  — v3 (shared-state edition)
+⚡ SB Momentum Radar Live  — shared-state edition
 ═══════════════════════════════════════════════════════
-KEY CHANGES vs v2
+KEY CHANGES (shared-state edition)
 ─────────────────
 • All tick data moved to @st.cache_resource  →  ONE shared store for every
   browser tab / user.  New user opening at 2 PM sees full day history.
@@ -167,7 +167,7 @@ def closed_screen_html(next_open: dt.datetime) -> str:
   tick(); setInterval(tick,1000);
   function updateIST(){{
     const now=new Date();
-    const ist=new Date(now.getTime()+(5*60+30)*60000-now.getTimezoneOffset()*60000);
+    const ist=new Date(now.getTime()+(5*60+30)*60000);
     document.getElementById('ist-now').textContent=ist.toISOString().replace('T',' ').substring(0,19)+' IST';
   }}
   updateIST(); setInterval(updateIST,1000);
@@ -752,7 +752,7 @@ function switchTab(id){{
 </script></body></html>"""
 
 # ══════════════════════════════════════════════════════
-#  MAIN TABLE HTML  (unchanged from v2, references shared)
+#  MAIN TABLE HTML
 # ══════════════════════════════════════════════════════
 def build_html(results, ts, tick, hof, warming):
 
