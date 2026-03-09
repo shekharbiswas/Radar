@@ -1,8 +1,6 @@
 """
-Momentum Radar  — shared-state 
+Momentum Radar Live  
 ═══════════════════════════════════════════════════════
-KEY CHANGES (shared-state edition)
-─────────────────
 • All tick data moved to @st.cache_resource  →  ONE shared store for every
   browser tab / user.  
 
@@ -21,12 +19,13 @@ DEPLOYMENT
 • Keep ONE PC browser tab open 09:15–15:30 → drives the fetch loop.
 • Any other user (mobile / another PC) opening mid-day sees the full
   day's spike history immediately.
+• No database, no file I/O, no background threads required.
 """
 
 import streamlit as st
 import pandas as pd
 import datetime as dt
-import math, time, json, threading
+import math, time, json, threading, os
 
 # ══════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -63,6 +62,9 @@ MARKET_OPEN  = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
 IST          = dt.timezone(dt.timedelta(hours=5, minutes=30))
 CLOSED_RECHECK_SEC = 30
+
+# ── CSV output directory ─────────────────────────────
+DATA_DIR = "data/logs"   # relative to app root; created automatically
 
 # ══════════════════════════════════════════════════════
 #  MARKET HELPERS
@@ -691,6 +693,10 @@ def update_spike_logs(results, shared):
 
             # Prepend (newest first)
             shared["signal_log"].insert(0, entry)
+            try:
+                save_signal_csv(entry)   # persist to CSV
+            except Exception as e:
+                pass  # never let CSV write crash the app
 
             if "STRONG BUY" in cur_sig:
                 shared["strong_buy_log"].insert(0, entry)
@@ -698,6 +704,103 @@ def update_spike_logs(results, shared):
         # Safety cap — keep at most 500 entries (full day is unlikely to exceed this)
         shared["signal_log"]      = shared["signal_log"][:500]
         shared["strong_buy_log"]  = shared["strong_buy_log"][:200]
+
+
+# ══════════════════════════════════════════════════════
+#  CSV PERSISTENCE
+#
+#  signals_YYYYMMDD.csv  — one row per signal event
+#    (gate-passed first appearance + upgrades only)
+#  ticks_YYYYMMDD.csv    — one row per stock per tick
+#    (every scan, all symbols, full key columns)
+#
+#  Both files are appended incrementally so a server
+#  restart mid-day loses nothing already written.
+# ══════════════════════════════════════════════════════
+def _csv_path(prefix: str) -> str:
+    """Return dated file path, creating DATA_DIR if needed."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    date_str = ist_now().strftime("%Y%m%d")
+    return os.path.join(DATA_DIR, f"{prefix}_{date_str}.csv")
+
+
+def save_signal_csv(entry: dict):
+    """Append one signal event row to signals_YYYYMMDD.csv."""
+    path = _csv_path("signals")
+    write_header = not os.path.exists(path)
+    cols = [
+        "date", "time_ist", "symbol", "signal", "score",
+        "price_at_signal", "trigger_time", "trigger_price", "trigger_chg_pct",
+        "z_spike", "ratio", "vwap_gap", "candle_dir",
+        "checks_passed", "checks_total",
+    ]
+    now_ist = ist_now()
+    row = {
+        "date"            : now_ist.strftime("%Y-%m-%d"),
+        "time_ist"        : entry["time"],
+        "symbol"          : entry["sym"],
+        "signal"          : entry["signal"],
+        "score"           : entry["score"],
+        "price_at_signal" : entry["price"],
+        "trigger_time"    : entry.get("trigger_time", ""),
+        "trigger_price"   : entry.get("trigger_price", ""),
+        "trigger_chg_pct" : entry.get("trigger_chg", ""),
+        "z_spike"         : entry["z_spike"],
+        "ratio"           : entry["ratio"],
+        "vwap_gap"        : entry["vwap_gap"],
+        "candle_dir"      : entry["candle_dir"],
+        "checks_passed"   : entry["checks_passed"],
+        "checks_total"    : entry["checks_total"],
+    }
+    df = pd.DataFrame([row], columns=cols)
+    df.to_csv(path, mode="a", header=write_header, index=False)
+
+
+def save_tick_csv(results: list, all_symbols: list, shared: dict):
+    """
+    Append one row per symbol per tick to ticks_YYYYMMDD.csv.
+    symbols that did not pass gates are still included with their
+    gate_fail_reason so you can see why they were excluded.
+    """
+    path     = _csv_path("ticks")
+    write_hdr= not os.path.exists(path)
+    now_ist  = ist_now()
+    date_str = now_ist.strftime("%Y-%m-%d")
+    time_str = now_ist.strftime("%H:%M:%S")
+    S        = shared["store"]
+
+    # Build a lookup of ranked results for quick access
+    ranked = {r["sym"]: r for r in results}
+
+    rows = []
+    for sym in all_symbols:
+        d   = S.get(sym, {})
+        r   = ranked.get(sym)        # None if didn't pass gates
+        ltp = d["price"][-1]  if d.get("price")  else None
+        delta = d["delta"][-1] if d.get("delta") else None
+        rows.append({
+            "date"            : date_str,
+            "time_ist"        : time_str,
+            "symbol"          : sym,
+            "price"           : ltp,
+            "delta_vol"       : delta,
+            "cum_vol"         : d["cum"][-1]   if d.get("cum")   else None,
+            "price_pct"       : round(d["price_pct"][-1], 4) if d.get("price_pct") else None,
+            "ratio"           : round(r["ratio"], 2)    if r else None,
+            "z_spike"         : round(r["z_spike"], 2)  if r else None,
+            "score"           : round(r["score"], 2)    if r else None,
+            "signal"          : r["signal"]              if r else "",
+            "candle_dir"      : r["candle_dir"]          if r else "",
+            "vwap"            : round(r["vwap"], 2)      if r else None,
+            "vwap_gap"        : round(r["vwap_gap"], 3)  if r else None,
+            "elevated_streak" : r["elevated_streak"]     if r else 0,
+            "checks_passed"   : sum(1 for c in r["checks"] if c[1]) if r else 0,
+            "gate_fail_reason": d.get("gate_fail_reason", ""),
+            "gate_passed"     : 1 if r else 0,
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(path, mode="a", header=write_hdr, index=False)
 
 # ══════════════════════════════════════════════════════
 #  INDICATOR CHECKS  (used in rank_stocks + tooltip)
@@ -1294,6 +1397,13 @@ def main():
 
     # ── Update spike logs ─────────────────────────────
     update_spike_logs(results, shared)
+
+    # ── Persist tick snapshot to CSV ─────────────────────
+    if fetched:   # only write on actual new fetch, not re-renders
+        try:
+            save_tick_csv(results, symbols, shared)
+        except Exception as e:
+            pass  # never let CSV write crash the app
 
     # ── HOF update ────────────────────────────────────
     if shared["tick"] > WARMUP_TICKS:
