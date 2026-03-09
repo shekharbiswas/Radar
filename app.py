@@ -1,5 +1,5 @@
 """
-⚡ Momentum Radar v2 — NSE Live
+⚡ SB - Momentum Radar — NSE Live
 Streamlit Cloud edition:
   • Credentials from st.secrets
   • Original HTML table + tooltip (hover desktop / tap bottom-sheet mobile)
@@ -16,7 +16,7 @@ import math, time, json
 #  PAGE CONFIG  (must be first Streamlit call)
 # ══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="⚡ Momentum Radar",
+    page_title="⚡ SB - Momentum Radar",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
