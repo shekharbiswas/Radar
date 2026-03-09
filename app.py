@@ -1,10 +1,10 @@
 """
-⚡ SB Momentum Radar Live  — shared-state edition
+Momentum Radar  — shared-state 
 ═══════════════════════════════════════════════════════
 KEY CHANGES (shared-state edition)
 ─────────────────
 • All tick data moved to @st.cache_resource  →  ONE shared store for every
-  browser tab / user.  New user opening at 2 PM sees full day history.
+  browser tab / user.  
 
 • Fetch gate  →  API called at most once per REFRESH_SEC regardless of how
   many users are connected.  PC tab drives the loop; mobile users just read.
@@ -21,7 +21,6 @@ DEPLOYMENT
 • Keep ONE PC browser tab open 09:15–15:30 → drives the fetch loop.
 • Any other user (mobile / another PC) opening mid-day sees the full
   day's spike history immediately.
-• No database, no file I/O, no background threads required.
 """
 
 import streamlit as st
@@ -113,66 +112,149 @@ def closed_screen_html(next_open: dt.datetime) -> str:
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;
-       display:flex;flex-direction:column;align-items:center;justify-content:center;
-       min-height:420px;gap:20px;padding:24px}}
-  .clock{{font-size:clamp(36px,8vw,64px);font-weight:700;
-          background:linear-gradient(135deg,#FFD700,#ff9800);
-          -webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px}}
-  .badge{{background:#0e0e18;border:1px solid #1e1e2e;border-radius:10px;padding:16px 28px;text-align:center}}
-  .next-lbl{{color:#333;font-size:11px;letter-spacing:1px;margin-bottom:6px}}
-  .next-val{{color:#FFD700;font-size:clamp(13px,3vw,16px);font-weight:700}}
-  .ticker{{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center}}
-  .tick-item{{text-align:center}}
-  .tick-num{{font-size:clamp(24px,6vw,44px);font-weight:700;color:#fff;background:#0e0e18;
-             border:1px solid #252535;border-radius:8px;padding:8px 14px;min-width:60px;display:inline-block}}
-  .tick-lbl{{color:#444;font-size:10px;margin-top:4px;letter-spacing:1px}}
-  .pulse{{animation:pulse 2s ease-in-out infinite}}
-  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
-  .dot{{color:#ff5252;font-size:28px}}
-</style></head><body>
-<div style="text-align:center">
-  <div style="color:#ff5252;font-size:28px;margin-bottom:6px">🔴</div>
-  <div style="color:#ff5252;font-weight:700;font-size:clamp(14px,3vw,18px);letter-spacing:2px">NSE MARKET CLOSED</div>
-  <div style="color:#555;font-size:12px;margin-top:4px">{label}</div>
+  body {{
+    background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:480px;gap:18px;padding:24px 24px 48px;
+    overflow:hidden;position:relative;
+  }}
+  #grid {{
+    position:absolute;inset:0;pointer-events:none;
+    background-image:linear-gradient(rgba(255,215,0,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,215,0,0.03) 1px,transparent 1px);
+    background-size:44px 44px;animation:gridDrift 24s linear infinite;
+  }}
+  @keyframes gridDrift{{0%{{background-position:0 0}}100%{{background-position:44px 44px}}}}
+  .status-badge {{
+    display:inline-flex;align-items:center;gap:8px;background:#120000;
+    border:1px solid #ff525430;border-radius:20px;padding:6px 18px;
+    animation:badgePulse 2s ease-in-out infinite;
+  }}
+  @keyframes badgePulse{{0%,100%{{border-color:#ff525430}}50%{{border-color:#ff525288;box-shadow:0 0 12px #ff52521a}}}}
+  .red-dot {{width:8px;height:8px;border-radius:50%;background:#ff5252;box-shadow:0 0 6px #ff5252;animation:dotBlink 1.2s ease-in-out infinite;}}
+  @keyframes dotBlink{{0%,100%{{opacity:1}}50%{{opacity:.2}}}}
+  .badge {{background:#0a0a12;border:1px solid #1e1e2e;border-radius:12px;padding:14px 28px;text-align:center;animation:fadeUp .6s ease both;}}
+  @keyframes fadeUp{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:translateY(0)}}}}
+  .next-lbl {{color:#333;font-size:10px;letter-spacing:1.5px;margin-bottom:6px;text-transform:uppercase}}
+  .next-val {{color:#FFD700;font-size:clamp(13px,3vw,15px);font-weight:700}}
+  .glow-ring {{
+    padding:20px 28px;border-radius:14px;background:#08080f;border:1px solid #1a1a28;
+    animation:ringPulse 3s ease-in-out infinite,fadeUp .8s ease both;
+  }}
+  @keyframes ringPulse{{0%,100%{{box-shadow:0 0 0 1px #FFD70010,0 0 40px #FFD70008}}50%{{box-shadow:0 0 0 1px #FFD70030,0 0 60px #FFD70018}}}}
+  .tick-num {{
+    font-size:clamp(30px,6vw,50px);font-weight:700;color:#fff;background:#0d0d18;
+    border:1px solid #222235;border-radius:8px;padding:10px 18px;min-width:72px;
+    display:inline-block;text-align:center;box-shadow:inset 0 2px 10px rgba(0,0,0,.6);
+  }}
+  .tick-num.flash{{animation:flash .15s ease;}}
+  @keyframes flash{{0%{{transform:scaleY(1);color:#fff}}40%{{transform:scaleY(.05);color:#FFD700}}100%{{transform:scaleY(1);color:#fff}}}}
+  .tick-lbl{{color:#333;font-size:10px;margin-top:5px;letter-spacing:1.5px;text-align:center}}
+  .sep{{color:#FFD700;font-size:38px;padding:0 2px;opacity:.35;animation:sepBlink 1s step-start infinite;margin-bottom:16px;}}
+  @keyframes sepBlink{{0%,100%{{opacity:.35}}50%{{opacity:0}}}}
+  .ist-time{{color:#333;font-size:11px;text-align:center;line-height:2}}
+  .tape-wrap{{position:absolute;bottom:0;left:0;right:0;overflow:hidden;border-top:1px solid #0e0e18;padding:5px 0;background:#060608;}}
+  .tape-inner{{display:inline-block;white-space:nowrap;animation:tape 22s linear infinite;font-size:10px;letter-spacing:.5px;}}
+  @keyframes tape{{0%{{transform:translateX(0)}}100%{{transform:translateX(-50%)}}}}
+</style>
+</head><body>
+
+<div id="grid"></div>
+<canvas id="cv" style="position:absolute;inset:0;pointer-events:none;opacity:.15"></canvas>
+
+<div class="status-badge">
+  <div class="red-dot"></div>
+  <span style="color:#ff5252;font-weight:700;font-size:12px;letter-spacing:2px">NSE MARKET CLOSED</span>
 </div>
+<div style="color:#444;font-size:11px;margin-top:-10px;text-align:center">{label}</div>
+
 <div class="badge">
-  <div class="next-lbl">NEXT OPEN (IST)</div>
+  <div class="next-lbl">Next Open (IST)</div>
   <div class="next-val">{next_open.strftime("%A, %d %b %Y · %H:%M")}</div>
 </div>
+
 <div>
-  <div style="color:#555;font-size:11px;text-align:center;margin-bottom:12px;letter-spacing:1px">OPENS IN</div>
-  <div class="ticker">
-    <div class="tick-item"><div class="tick-num" id="hh">--</div><div class="tick-lbl">HOURS</div></div>
-    <div class="tick-item" style="padding-top:8px"><div class="dot pulse">:</div></div>
-    <div class="tick-item"><div class="tick-num" id="mm">--</div><div class="tick-lbl">MINS</div></div>
-    <div class="tick-item" style="padding-top:8px"><div class="dot pulse">:</div></div>
-    <div class="tick-item"><div class="tick-num" id="ss">--</div><div class="tick-lbl">SECS</div></div>
+  <div style="color:#333;font-size:10px;text-align:center;margin-bottom:10px;letter-spacing:2px">OPENS IN</div>
+  <div class="glow-ring">
+    <div style="display:flex;align-items:center;justify-content:center;gap:2px">
+      <div><div class="tick-num" id="hh">--</div><div class="tick-lbl">HRS</div></div>
+      <div class="sep">:</div>
+      <div><div class="tick-num" id="mm">--</div><div class="tick-lbl">MIN</div></div>
+      <div class="sep">:</div>
+      <div><div class="tick-num" id="ss">--</div><div class="tick-lbl">SEC</div></div>
+    </div>
   </div>
 </div>
-<div style="color:#333;font-size:11px;text-align:center">
-  IST now: <span id="ist-now" style="color:#444"></span>
-  <br><span style="color:#333;font-size:10px">Page rechecks every {CLOSED_RECHECK_SEC}s</span>
+
+<div class="ist-time">
+  <span id="ist-now" style="color:#555"></span>
+  <br><span style="color:#1e1e1e;font-size:10px">page reloads automatically at 09:15 IST</span>
 </div>
+
+<div class="tape-wrap"><div class="tape-inner" id="tape"></div></div>
+
 <script>
-  let secs={secs_left};
-  const pad=n=>String(n).padStart(2,'0');
-  function tick(){{
-    if(secs<=0){{window.parent.location.reload();return}}
-    document.getElementById('hh').textContent=pad(Math.floor(secs/3600));
-    document.getElementById('mm').textContent=pad(Math.floor((secs%3600)/60));
-    document.getElementById('ss').textContent=pad(secs%60);
-    secs--;
-  }}
-  tick(); setInterval(tick,1000);
-  function updateIST(){{
-    const now=new Date();
-    const ist=new Date(now.getTime()+(5*60+30)*60000);
-    document.getElementById('ist-now').textContent=ist.toISOString().replace('T',' ').substring(0,19)+' IST';
-  }}
-  updateIST(); setInterval(updateIST,1000);
-  setTimeout(()=>window.parent.location.reload(),{CLOSED_RECHECK_SEC*1000});
-</script></body></html>"""
+let secs = {secs_left};
+const pad = n => String(n).padStart(2,'0');
+const hEl=document.getElementById('hh'), mEl=document.getElementById('mm'), sEl=document.getElementById('ss');
+let prev={{'h':'--','m':'--','s':'--'}};
+function setFlip(el,key,val){{
+  if(prev[key]===val)return; prev[key]=val;
+  el.textContent=val; el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+}}
+function tickDown(){{
+  if(secs<=0){{window.parent.location.reload();return;}}
+  setFlip(hEl,'h',pad(Math.floor(secs/3600)));
+  setFlip(mEl,'m',pad(Math.floor((secs%3600)/60)));
+  setFlip(sEl,'s',pad(secs%60));
+  secs--;
+}}
+tickDown(); setInterval(tickDown,1000);
+
+function updateIST(){{
+  const now=new Date();
+  const ist=new Date(now.getTime()+(5*60+30)*60000);
+  document.getElementById('ist-now').textContent=ist.toISOString().replace('T',' ').substring(0,19)+' IST';
+}}
+updateIST(); setInterval(updateIST,1000);
+
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+function resize(){{cv.width=cv.offsetWidth;cv.height=cv.offsetHeight;}} resize();
+window.addEventListener('resize',resize);
+function newC(){{
+  const g=Math.random()>.42;
+  return{{x:10+Math.random()*(cv.width-20),y:cv.height+80,bh:12+Math.random()*55,bw:4+Math.random()*7,wt:4+Math.random()*18,wb:3+Math.random()*14,color:g?'#00e676':'#ff5252',speed:.25+Math.random()*.5,alpha:0}};
+}}
+let sticks=Array.from({{length:16}},()=>{{const c=newC();c.y=Math.random()*cv.height;return c;}});
+(function draw(){{
+  ctx.clearRect(0,0,cv.width,cv.height);
+  sticks.forEach((c,i)=>{{
+    c.y-=c.speed;
+    if(c.y<-c.bh-c.wt-30)sticks[i]=newC();
+    const prog=1-c.y/cv.height;
+    c.alpha=Math.min(1,prog<.08?prog/.08:prog>.82?(1-prog)/.18:1);
+    ctx.globalAlpha=c.alpha; ctx.strokeStyle=c.color; ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(c.x,c.y-c.bh-c.wt);ctx.lineTo(c.x,c.y-c.bh);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(c.x,c.y);ctx.lineTo(c.x,c.y+c.wb);ctx.stroke();
+    ctx.globalAlpha=c.alpha*.22; ctx.fillStyle=c.color;
+    ctx.fillRect(c.x-c.bw/2,c.y-c.bh,c.bw,c.bh);
+    ctx.globalAlpha=c.alpha*.7; ctx.strokeRect(c.x-c.bw/2,c.y-c.bh,c.bw,c.bh);
+  }});
+  ctx.globalAlpha=1; requestAnimationFrame(draw);
+}})();
+
+const syms=['RELIANCE','TCS','HDFCBANK','INFY','ICICIBANK','SBIN','BHARTIARTL','ITC','LT','KOTAKBANK','AXISBANK','WIPRO','HCLTECH','MARUTI','BAJFINANCE','TITAN','SUNPHARMA','NTPC','POWERGRID','ADANIENT'];
+const chgs=['+1.24%','-0.38%','+0.81%','+2.05%','-0.92%','+0.33%','+1.71%','-0.17%','+0.64%','-1.08%'];
+let t='';
+for(let r=0;r<2;r++) syms.forEach((s,j)=>{{
+  const c=chgs[j%chgs.length],pos=c.startsWith('+');
+  t+=`<span style="color:#1c1c1c;margin:0 6px">${{s}}</span><span style="color:${{pos?'#0d2a0d':'#2a0d0d'}};margin-right:16px">${{c}}</span>`;
+}});
+document.getElementById('tape').innerHTML=t;
+// reloads automatically when countdown reaches zero
+</script>
+</body></html>"""
+
+
 
 # ══════════════════════════════════════════════════════
 #  GLOBAL CSS
