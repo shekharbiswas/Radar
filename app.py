@@ -1,5 +1,5 @@
 """
-⚡ Momentum Radar v2 — NSE Live
+⚡ SB Momentum Radar Live
 Streamlit Cloud edition:
   • Credentials from st.secrets
   • Original HTML table + tooltip (hover desktop / tap bottom-sheet mobile)
