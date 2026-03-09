@@ -1,5 +1,5 @@
 """
-⚡ SB - Momentum Radar — NSE Live
+⚡ Momentum Radar v2 — NSE Live
 Streamlit Cloud edition:
   • Credentials from st.secrets
   • Original HTML table + tooltip (hover desktop / tap bottom-sheet mobile)
@@ -16,7 +16,7 @@ import math, time, json
 #  PAGE CONFIG  (must be first Streamlit call)
 # ══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="⚡ SB - Momentum Radar",
+    page_title="SB Momentum Radar",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -42,6 +42,187 @@ GATE_VOL_ABS    = 5000
 GATE_ELEV_TICKS = 3
 GATE_ROC        = 1.5
 CANDLE_TICKS    = 6
+
+# NSE market hours (IST = UTC+5:30)
+MARKET_OPEN  = dt.time(9, 15)
+MARKET_CLOSE = dt.time(15, 30)
+IST_OFFSET   = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+# How often to recheck when market is closed (seconds)
+CLOSED_RECHECK_SEC = 30
+
+# ══════════════════════════════════════════════════════
+#  MARKET HOURS HELPERS
+# ══════════════════════════════════════════════════════
+def ist_now() -> dt.datetime:
+    return dt.datetime.now(IST_OFFSET)
+
+def is_market_open() -> bool:
+    """Return True only during NSE trading hours Mon–Fri 09:15–15:30 IST."""
+    n = ist_now()
+    if n.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    t = n.time()
+    return MARKET_OPEN <= t <= MARKET_CLOSE
+
+def next_market_open() -> dt.datetime:
+    """Return the next NSE opening datetime in IST."""
+    n    = ist_now()
+    day  = n
+    # If today's open is still in the future, use today
+    if day.weekday() < 5 and day.time() < MARKET_OPEN:
+        return day.replace(hour=9, minute=15, second=0, microsecond=0)
+    # Otherwise advance to next weekday
+    for _ in range(7):
+        day += dt.timedelta(days=1)
+        if day.weekday() < 5:
+            return day.replace(hour=9, minute=15, second=0, microsecond=0)
+    return day.replace(hour=9, minute=15, second=0, microsecond=0)   # fallback
+
+def market_session_label() -> str:
+    n = ist_now()
+    t = n.time()
+    if n.weekday() >= 5:
+        day_name = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][n.weekday()]
+        return f"Weekend ({day_name}) — market reopens Monday 09:15 IST"
+    if t < MARKET_OPEN:
+        return "Pre-market — session opens at 09:15 IST"
+    if t > MARKET_CLOSE:
+        return "Post-market — session closed at 15:30 IST"
+    return "Market OPEN"
+
+
+def closed_screen_html(next_open: dt.datetime) -> str:
+    """Build a self-refreshing 'market closed' HTML page."""
+    now_ist  = ist_now()
+    secs_left = max(0, int((next_open - now_ist).total_seconds()))
+    label    = market_session_label()
+
+    return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
+  * {{ box-sizing:border-box;margin:0;padding:0 }}
+  body {{
+    background:#060608;
+    font-family:'JetBrains Mono','Courier New',monospace;
+    color:#d0d0d8;
+    display:flex;flex-direction:column;align-items:center;
+    justify-content:center;min-height:420px;gap:20px;padding:24px;
+  }}
+  .clock {{
+    font-size:clamp(36px,8vw,64px);font-weight:700;
+    background:linear-gradient(135deg,#FFD700,#ff9800);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    letter-spacing:2px;
+  }}
+  .label {{
+    font-size:clamp(11px,2.5vw,14px);color:#555;letter-spacing:1.5px;
+    text-transform:uppercase;text-align:center;
+  }}
+  .badge {{
+    background:#0e0e18;border:1px solid #1e1e2e;border-radius:10px;
+    padding:16px 28px;text-align:center;
+  }}
+  .next-lbl {{ color:#333;font-size:11px;letter-spacing:1px;margin-bottom:6px }}
+  .next-val {{ color:#FFD700;font-size:clamp(13px,3vw,16px);font-weight:700 }}
+  .ticker {{
+    display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center
+  }}
+  .tick-item {{ text-align:center }}
+  .tick-num {{
+    font-size:clamp(24px,6vw,44px);font-weight:700;color:#fff;
+    background:#0e0e18;border:1px solid #252535;border-radius:8px;
+    padding:8px 14px;min-width:60px;display:inline-block;
+  }}
+  .tick-lbl {{ color:#444;font-size:10px;margin-top:4px;letter-spacing:1px }}
+  .pulse {{ animation:pulse 2s ease-in-out infinite }}
+  @keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:.5}} }}
+  .dot {{ color:#ff5252;font-size:28px }}
+  .recheck {{ color:#333;font-size:10px;margin-top:4px }}
+</style>
+</head><body>
+
+<div style="text-align:center">
+  <div style="color:#ff5252;font-size:28px;margin-bottom:6px">🔴</div>
+  <div style="color:#ff5252;font-weight:700;font-size:clamp(14px,3vw,18px);letter-spacing:2px">
+    NSE MARKET CLOSED
+  </div>
+  <div style="color:#555;font-size:12px;margin-top:4px">{label}</div>
+</div>
+
+<div class="badge">
+  <div class="next-lbl">NEXT OPEN (IST)</div>
+  <div class="next-val">{next_open.strftime("%A, %d %b %Y · %H:%M")}</div>
+</div>
+
+<div>
+  <div style="color:#555;font-size:11px;text-align:center;margin-bottom:12px;letter-spacing:1px">
+    OPENS IN
+  </div>
+  <div class="ticker" id="ticker">
+    <div class="tick-item">
+      <div class="tick-num" id="hh">--</div>
+      <div class="tick-lbl">HOURS</div>
+    </div>
+    <div class="tick-item" style="padding-top:8px">
+      <div class="dot pulse">:</div>
+    </div>
+    <div class="tick-item">
+      <div class="tick-num" id="mm">--</div>
+      <div class="tick-lbl">MINS</div>
+    </div>
+    <div class="tick-item" style="padding-top:8px">
+      <div class="dot pulse">:</div>
+    </div>
+    <div class="tick-item">
+      <div class="tick-num" id="ss">--</div>
+      <div class="tick-lbl">SECS</div>
+    </div>
+  </div>
+</div>
+
+<div style="color:#333;font-size:11px;text-align:center">
+  IST now: <span id="ist-now" style="color:#444"></span>
+  <br><span class="recheck">Page rechecks every {CLOSED_RECHECK_SEC}s — will auto-load when market opens</span>
+</div>
+
+<script>
+  let secs = {secs_left};
+  function pad(n){{ return String(n).padStart(2,'0'); }}
+
+  function updateClock(){{
+    if(secs <= 0){{
+      // Market just opened — reload parent Streamlit
+      window.parent.location.reload();
+      return;
+    }}
+    const h = Math.floor(secs/3600);
+    const m = Math.floor((secs%3600)/60);
+    const s = secs%60;
+    document.getElementById('hh').textContent = pad(h);
+    document.getElementById('mm').textContent = pad(m);
+    document.getElementById('ss').textContent = pad(s);
+    secs--;
+  }}
+  updateClock();
+  setInterval(updateClock, 1000);
+
+  // Show live IST time
+  function updateIST(){{
+    const now = new Date();
+    const ist = new Date(now.getTime() + (5*60+30)*60000 - now.getTimezoneOffset()*60000);
+    document.getElementById('ist-now').textContent =
+      ist.toISOString().replace('T',' ').substring(0,19) + ' IST';
+  }}
+  updateIST();
+  setInterval(updateIST, 1000);
+
+  // Recheck every CLOSED_RECHECK_SEC in case countdown drifts
+  setTimeout(()=> window.parent.location.reload(), {CLOSED_RECHECK_SEC * 1000});
+</script>
+</body></html>"""
 
 # ══════════════════════════════════════════════════════
 #  GLOBAL CSS
@@ -857,6 +1038,39 @@ const SB = {strong_buy_json};
 #  MAIN
 # ══════════════════════════════════════════════════════
 def main():
+    # ══ MARKET HOURS GATE ════════════════════════════
+    # Show a countdown screen when NSE is closed.
+    # The JS inside the component reloads the parent
+    # every CLOSED_RECHECK_SEC seconds, so when the
+    # market finally opens this page auto-transitions.
+    if not is_market_open():
+        import streamlit.components.v1 as components
+        next_open = next_market_open()
+        st.markdown(
+            '<h2 style="font-family:JetBrains Mono,monospace;color:#FFD700;'
+            'font-size:clamp(14px,3vw,20px);margin:0 0 8px;letter-spacing:1px">'
+            '⚡ SB Momentum Radar </h2>',
+            unsafe_allow_html=True,
+        )
+        components.html(
+            closed_screen_html(next_open),
+            height=480,
+            scrolling=False,
+        )
+        st.markdown(
+            f'<div style="color:#333;font-size:11px;text-align:center;margin-top:6px;'
+            f'font-family:JetBrains Mono,monospace">'
+            f'IST: {ist_now().strftime("%Y-%m-%d %H:%M:%S")} &nbsp;|&nbsp; '
+            f'Next open: {next_open.strftime("%a %d %b %H:%M IST")}</div>',
+            unsafe_allow_html=True,
+        )
+        # Also add a manual refresh button in case the user wants to force-check
+        if st.button("↻ Check now", key="closed_refresh"):
+            st.rerun()
+        # Stop here — don't login, don't fetch, don't render table
+        return
+    # ═════════════════════════════════════════════════
+
     obj    = load_api()
     stocks = load_stocks()
     symbols         = stocks["Symbol"].tolist()
@@ -871,7 +1085,7 @@ def main():
         st.markdown(
             '<h2 style="font-family:JetBrains Mono,monospace;color:#FFD700;'
             'font-size:clamp(14px,3vw,20px);margin:0;letter-spacing:1px">'
-            '⚡ SB Momentum Radar </h2>',
+            '⚡ Momentum Radar v2 — NSE</h2>',
             unsafe_allow_html=True,
         )
     tick    = st.session_state.tick
@@ -967,7 +1181,6 @@ def main():
     if refresh_btn:
         st.rerun()
 
-# SB
 
 if __name__ == "__main__":
     main()
