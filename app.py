@@ -1,19 +1,36 @@
 """
-⚡ SB Momentum Radar Live
-Streamlit Cloud edition:
-  • Credentials from st.secrets
-  • Original HTML table + tooltip (hover desktop / tap bottom-sheet mobile)
-  • Auto-refresh via JS countdown + manual Streamlit button
-  • Mobile-first responsive layout
+⚡ SB Momentum Radar Live  — v3 (shared-state edition)
+═══════════════════════════════════════════════════════
+KEY CHANGES vs v2
+─────────────────
+• All tick data moved to @st.cache_resource  →  ONE shared store for every
+  browser tab / user.  New user opening at 2 PM sees full day history.
+
+• Fetch gate  →  API called at most once per REFRESH_SEC regardless of how
+  many users are connected.  PC tab drives the loop; mobile users just read.
+
+• Spike log  →  two lists (all gate-passed + strong-buy-only) accumulated
+  from 09:15 IST, newest-on-top table at the bottom of the page.
+  Resets automatically at the start of each trading day.
+
+• Signal deduplication  →  each stock appended only on first appearance or
+  when signal upgrades (WATCH → STRONG BUY).  Never spams the same tick.
+
+DEPLOYMENT
+──────────
+• Keep ONE PC browser tab open 09:15–15:30 → drives the fetch loop.
+• Any other user (mobile / another PC) opening mid-day sees the full
+  day's spike history immediately.
+• No database, no file I/O, no background threads required.
 """
 
 import streamlit as st
 import pandas as pd
 import datetime as dt
-import math, time, json
+import math, time, json, threading
 
 # ══════════════════════════════════════════════════════
-#  PAGE CONFIG  (must be first Streamlit call)
+#  PAGE CONFIG
 # ══════════════════════════════════════════════════════
 st.set_page_config(
     page_title="SB Momentum Radar",
@@ -23,7 +40,7 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════
-#  CREDENTIALS from st.secrets
+#  CREDENTIALS
 # ══════════════════════════════════════════════════════
 API_KEY      = st.secrets["API_KEY"]
 CLIENT_ID    = st.secrets["CLIENT_ID"]
@@ -43,186 +60,119 @@ GATE_ELEV_TICKS = 3
 GATE_ROC        = 1.5
 CANDLE_TICKS    = 6
 
-# NSE market hours (IST = UTC+5:30)
 MARKET_OPEN  = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
-IST_OFFSET   = dt.timezone(dt.timedelta(hours=5, minutes=30))
-
-# How often to recheck when market is closed (seconds)
+IST          = dt.timezone(dt.timedelta(hours=5, minutes=30))
 CLOSED_RECHECK_SEC = 30
 
 # ══════════════════════════════════════════════════════
-#  MARKET HOURS HELPERS
+#  MARKET HELPERS
 # ══════════════════════════════════════════════════════
 def ist_now() -> dt.datetime:
-    return dt.datetime.now(IST_OFFSET)
+    return dt.datetime.now(IST)
 
 def is_market_open() -> bool:
-    """Return True only during NSE trading hours Mon–Fri 09:15–15:30 IST."""
     n = ist_now()
-    if n.weekday() >= 5:          # Saturday=5, Sunday=6
+    if n.weekday() >= 5:
         return False
     t = n.time()
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 def next_market_open() -> dt.datetime:
-    """Return the next NSE opening datetime in IST."""
-    n    = ist_now()
-    day  = n
-    # If today's open is still in the future, use today
+    n = ist_now()
+    day = n
     if day.weekday() < 5 and day.time() < MARKET_OPEN:
         return day.replace(hour=9, minute=15, second=0, microsecond=0)
-    # Otherwise advance to next weekday
     for _ in range(7):
         day += dt.timedelta(days=1)
         if day.weekday() < 5:
             return day.replace(hour=9, minute=15, second=0, microsecond=0)
-    return day.replace(hour=9, minute=15, second=0, microsecond=0)   # fallback
+    return day.replace(hour=9, minute=15, second=0, microsecond=0)
 
 def market_session_label() -> str:
     n = ist_now()
     t = n.time()
     if n.weekday() >= 5:
-        day_name = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][n.weekday()]
-        return f"Weekend ({day_name}) — market reopens Monday 09:15 IST"
+        return f"Weekend — market reopens Monday 09:15 IST"
     if t < MARKET_OPEN:
         return "Pre-market — session opens at 09:15 IST"
     if t > MARKET_CLOSE:
         return "Post-market — session closed at 15:30 IST"
     return "Market OPEN"
 
-
+# ══════════════════════════════════════════════════════
+#  CLOSED SCREEN
+# ══════════════════════════════════════════════════════
 def closed_screen_html(next_open: dt.datetime) -> str:
-    """Build a self-refreshing 'market closed' HTML page."""
-    now_ist  = ist_now()
+    now_ist   = ist_now()
     secs_left = max(0, int((next_open - now_ist).total_seconds()))
-    label    = market_session_label()
-
+    label     = market_session_label()
     return f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
-  * {{ box-sizing:border-box;margin:0;padding:0 }}
-  body {{
-    background:#060608;
-    font-family:'JetBrains Mono','Courier New',monospace;
-    color:#d0d0d8;
-    display:flex;flex-direction:column;align-items:center;
-    justify-content:center;min-height:420px;gap:20px;padding:24px;
-  }}
-  .clock {{
-    font-size:clamp(36px,8vw,64px);font-weight:700;
-    background:linear-gradient(135deg,#FFD700,#ff9800);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-    letter-spacing:2px;
-  }}
-  .label {{
-    font-size:clamp(11px,2.5vw,14px);color:#555;letter-spacing:1.5px;
-    text-transform:uppercase;text-align:center;
-  }}
-  .badge {{
-    background:#0e0e18;border:1px solid #1e1e2e;border-radius:10px;
-    padding:16px 28px;text-align:center;
-  }}
-  .next-lbl {{ color:#333;font-size:11px;letter-spacing:1px;margin-bottom:6px }}
-  .next-val {{ color:#FFD700;font-size:clamp(13px,3vw,16px);font-weight:700 }}
-  .ticker {{
-    display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center
-  }}
-  .tick-item {{ text-align:center }}
-  .tick-num {{
-    font-size:clamp(24px,6vw,44px);font-weight:700;color:#fff;
-    background:#0e0e18;border:1px solid #252535;border-radius:8px;
-    padding:8px 14px;min-width:60px;display:inline-block;
-  }}
-  .tick-lbl {{ color:#444;font-size:10px;margin-top:4px;letter-spacing:1px }}
-  .pulse {{ animation:pulse 2s ease-in-out infinite }}
-  @keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:.5}} }}
-  .dot {{ color:#ff5252;font-size:28px }}
-  .recheck {{ color:#333;font-size:10px;margin-top:4px }}
-</style>
-</head><body>
-
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;
+       display:flex;flex-direction:column;align-items:center;justify-content:center;
+       min-height:420px;gap:20px;padding:24px}}
+  .clock{{font-size:clamp(36px,8vw,64px);font-weight:700;
+          background:linear-gradient(135deg,#FFD700,#ff9800);
+          -webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px}}
+  .badge{{background:#0e0e18;border:1px solid #1e1e2e;border-radius:10px;padding:16px 28px;text-align:center}}
+  .next-lbl{{color:#333;font-size:11px;letter-spacing:1px;margin-bottom:6px}}
+  .next-val{{color:#FFD700;font-size:clamp(13px,3vw,16px);font-weight:700}}
+  .ticker{{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center}}
+  .tick-item{{text-align:center}}
+  .tick-num{{font-size:clamp(24px,6vw,44px);font-weight:700;color:#fff;background:#0e0e18;
+             border:1px solid #252535;border-radius:8px;padding:8px 14px;min-width:60px;display:inline-block}}
+  .tick-lbl{{color:#444;font-size:10px;margin-top:4px;letter-spacing:1px}}
+  .pulse{{animation:pulse 2s ease-in-out infinite}}
+  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
+  .dot{{color:#ff5252;font-size:28px}}
+</style></head><body>
 <div style="text-align:center">
   <div style="color:#ff5252;font-size:28px;margin-bottom:6px">🔴</div>
-  <div style="color:#ff5252;font-weight:700;font-size:clamp(14px,3vw,18px);letter-spacing:2px">
-    NSE MARKET CLOSED
-  </div>
+  <div style="color:#ff5252;font-weight:700;font-size:clamp(14px,3vw,18px);letter-spacing:2px">NSE MARKET CLOSED</div>
   <div style="color:#555;font-size:12px;margin-top:4px">{label}</div>
 </div>
-
 <div class="badge">
   <div class="next-lbl">NEXT OPEN (IST)</div>
   <div class="next-val">{next_open.strftime("%A, %d %b %Y · %H:%M")}</div>
 </div>
-
 <div>
-  <div style="color:#555;font-size:11px;text-align:center;margin-bottom:12px;letter-spacing:1px">
-    OPENS IN
-  </div>
-  <div class="ticker" id="ticker">
-    <div class="tick-item">
-      <div class="tick-num" id="hh">--</div>
-      <div class="tick-lbl">HOURS</div>
-    </div>
-    <div class="tick-item" style="padding-top:8px">
-      <div class="dot pulse">:</div>
-    </div>
-    <div class="tick-item">
-      <div class="tick-num" id="mm">--</div>
-      <div class="tick-lbl">MINS</div>
-    </div>
-    <div class="tick-item" style="padding-top:8px">
-      <div class="dot pulse">:</div>
-    </div>
-    <div class="tick-item">
-      <div class="tick-num" id="ss">--</div>
-      <div class="tick-lbl">SECS</div>
-    </div>
+  <div style="color:#555;font-size:11px;text-align:center;margin-bottom:12px;letter-spacing:1px">OPENS IN</div>
+  <div class="ticker">
+    <div class="tick-item"><div class="tick-num" id="hh">--</div><div class="tick-lbl">HOURS</div></div>
+    <div class="tick-item" style="padding-top:8px"><div class="dot pulse">:</div></div>
+    <div class="tick-item"><div class="tick-num" id="mm">--</div><div class="tick-lbl">MINS</div></div>
+    <div class="tick-item" style="padding-top:8px"><div class="dot pulse">:</div></div>
+    <div class="tick-item"><div class="tick-num" id="ss">--</div><div class="tick-lbl">SECS</div></div>
   </div>
 </div>
-
 <div style="color:#333;font-size:11px;text-align:center">
   IST now: <span id="ist-now" style="color:#444"></span>
-  <br><span class="recheck">Page rechecks every {CLOSED_RECHECK_SEC}s — will auto-load when market opens</span>
+  <br><span style="color:#333;font-size:10px">Page rechecks every {CLOSED_RECHECK_SEC}s</span>
 </div>
-
 <script>
-  let secs = {secs_left};
-  function pad(n){{ return String(n).padStart(2,'0'); }}
-
-  function updateClock(){{
-    if(secs <= 0){{
-      // Market just opened — reload parent Streamlit
-      window.parent.location.reload();
-      return;
-    }}
-    const h = Math.floor(secs/3600);
-    const m = Math.floor((secs%3600)/60);
-    const s = secs%60;
-    document.getElementById('hh').textContent = pad(h);
-    document.getElementById('mm').textContent = pad(m);
-    document.getElementById('ss').textContent = pad(s);
+  let secs={secs_left};
+  const pad=n=>String(n).padStart(2,'0');
+  function tick(){{
+    if(secs<=0){{window.parent.location.reload();return}}
+    document.getElementById('hh').textContent=pad(Math.floor(secs/3600));
+    document.getElementById('mm').textContent=pad(Math.floor((secs%3600)/60));
+    document.getElementById('ss').textContent=pad(secs%60);
     secs--;
   }}
-  updateClock();
-  setInterval(updateClock, 1000);
-
-  // Show live IST time
+  tick(); setInterval(tick,1000);
   function updateIST(){{
-    const now = new Date();
-    const ist = new Date(now.getTime() + (5*60+30)*60000 - now.getTimezoneOffset()*60000);
-    document.getElementById('ist-now').textContent =
-      ist.toISOString().replace('T',' ').substring(0,19) + ' IST';
+    const now=new Date();
+    const ist=new Date(now.getTime()+(5*60+30)*60000-now.getTimezoneOffset()*60000);
+    document.getElementById('ist-now').textContent=ist.toISOString().replace('T',' ').substring(0,19)+' IST';
   }}
-  updateIST();
-  setInterval(updateIST, 1000);
-
-  // Recheck every CLOSED_RECHECK_SEC in case countdown drifts
-  setTimeout(()=> window.parent.location.reload(), {CLOSED_RECHECK_SEC * 1000});
-</script>
-</body></html>"""
+  updateIST(); setInterval(updateIST,1000);
+  setTimeout(()=>window.parent.location.reload(),{CLOSED_RECHECK_SEC*1000});
+</script></body></html>"""
 
 # ══════════════════════════════════════════════════════
 #  GLOBAL CSS
@@ -230,27 +180,22 @@ def closed_screen_html(next_open: dt.datetime) -> str:
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&display=swap');
-  html, body, .stApp { background:#060608 !important; color:#d0d0d8 !important; font-family:'JetBrains Mono',monospace; }
-  .stApp > header { background:#060608 !important; }
-  div[data-testid="metric-container"] {
-    background:linear-gradient(135deg,#0e0e14,#111118);
-    border:1px solid #1e1e28; border-radius:10px; padding:12px 14px;
-  }
-  div[data-testid="metric-container"] label { color:#444 !important; font-size:10px !important; letter-spacing:1.5px; text-transform:uppercase; }
-  div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color:#FFD700 !important; font-family:'JetBrains Mono',monospace !important; font-size:20px !important; }
-  .stButton > button { background:#0e0e14 !important; color:#FFD700 !important; border:1px solid #2a2a3a !important; border-radius:8px !important; font-family:'JetBrains Mono',monospace !important; font-size:13px !important; }
-  .stButton > button:hover { background:#1a1a2a !important; border-color:#FFD700 !important; }
-  details { background:#0e0e14 !important; border:1px solid #1e1e28 !important; border-radius:8px !important; }
-  hr { border-color:#1a1a24 !important; margin:8px 0 !important; }
-  #MainMenu, footer, header { visibility:hidden; }
-  .stDeployButton { display:none; }
-  @media (max-width:768px) { section.main > div { padding:6px !important; } }
+  html,body,.stApp{background:#060608!important;color:#d0d0d8!important;font-family:'JetBrains Mono',monospace}
+  .stApp>header{background:#060608!important}
+  div[data-testid="metric-container"]{background:linear-gradient(135deg,#0e0e14,#111118);border:1px solid #1e1e28;border-radius:10px;padding:12px 14px}
+  div[data-testid="metric-container"] label{color:#444!important;font-size:10px!important;letter-spacing:1.5px;text-transform:uppercase}
+  div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#FFD700!important;font-family:'JetBrains Mono',monospace!important;font-size:20px!important}
+  .stButton>button{background:#0e0e14!important;color:#FFD700!important;border:1px solid #2a2a3a!important;border-radius:8px!important;font-family:'JetBrains Mono',monospace!important;font-size:13px!important}
+  .stButton>button:hover{background:#1a1a2a!important;border-color:#FFD700!important}
+  hr{border-color:#1a1a24!important;margin:8px 0!important}
+  #MainMenu,footer,header{visibility:hidden}
+  .stDeployButton{display:none}
+  @media(max-width:768px){section.main>div{padding:6px!important}}
 </style>
 """, unsafe_allow_html=True)
 
-
 # ══════════════════════════════════════════════════════
-#  HELPERS
+#  PURE HELPERS  (no state)
 # ══════════════════════════════════════════════════════
 def fmt(v):
     if v >= 1e7: return f"{v/1e7:.1f}Cr"
@@ -260,23 +205,23 @@ def fmt(v):
 
 def mean_std(values):
     if len(values) < 2: return 0, 1
-    m  = sum(values) / len(values)
-    sd = math.sqrt(sum((x-m)**2 for x in values) / len(values))
+    m  = sum(values)/len(values)
+    sd = math.sqrt(sum((x-m)**2 for x in values)/len(values))
     return m, max(sd, 1e-9)
 
 def z_score(value, values):
     m, sd = mean_std(values)
-    return (value - m) / sd
+    return (value-m)/sd
 
 def bucket(price):
-    return round(round(price / PRICE_BUCKET) * PRICE_BUCKET, 2)
+    return round(round(price/PRICE_BUCKET)*PRICE_BUCKET, 2)
 
 def top_accum_zone(d, n=3):
     if not d: return []
     return sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
 
 def vwap_calc(d):
-    return d["vwap_num"] / d["vwap_den"] if d["vwap_den"] else 0
+    return d["vwap_num"]/d["vwap_den"] if d["vwap_den"] else 0
 
 def strength_label(score):
     if score >= 20: return "🔥 EXTREME",  "#ff1744"
@@ -295,8 +240,8 @@ def score_bg(score):
 
 def momentum_roc(hist, cur):
     if len(hist) < 3: return 0.0
-    avg = sum(hist[-3:]) / 3
-    return cur / avg if avg >= 0.1 else 0.0
+    avg = sum(hist[-3:])/3
+    return cur/avg if avg >= 0.1 else 0.0
 
 def two_candle_confirm(pl):
     n = CANDLE_TICKS
@@ -338,9 +283,8 @@ def compute_signal(score, pdelta, pl, zs, ratio, vgap, cc, sr, ah, ve):
     if td and zs>2:                      return "🔴 DIST",        "#ff5252", cd,co_,cc_,cp
     return                               "⬜ NEUTRAL",            "#444",    cd,co_,cc_,cp
 
-
 # ══════════════════════════════════════════════════════
-#  DATA STORE
+#  PER-SYMBOL STORE FACTORY
 # ══════════════════════════════════════════════════════
 def new_store():
     return dict(
@@ -353,11 +297,69 @@ def new_store():
         z_spike_hist=[], score_hist=[], vwap_gap_hist=[],
         elevated_streak=0, gate_fail_reason="",
         trigger_time=None, trigger_price=None,
+        # track last logged signal for deduplication
+        last_logged_signal="",
     )
 
+# ══════════════════════════════════════════════════════
+#  SHARED STATE  ← replaces session_state for all data
+#
+#  @st.cache_resource creates ONE instance on the server.
+#  Every user's every rerun reads/writes this same object.
+#  Protected by a threading.Lock for safe concurrent writes.
+# ══════════════════════════════════════════════════════
+@st.cache_resource
+def get_shared_state():
+    return dict(
+        store           = {},          # sym → new_store()
+        tick            = 0,
+        last_fetch_ts   = None,        # datetime — fetch gate
+        top3_freq       = {},
+        top3_last_rank  = {},
+        hof_strength    = {},
+        last_results    = [],
+        last_ts         = None,
+        # ── Spike logs ──────────────────────────────
+        signal_log      = [],          # all gate-passed (deduped)
+        strong_buy_log  = [],          # STRONG BUY only (deduped)
+        last_session_date = None,      # dt.date — for day reset
+        # ── Lock ────────────────────────────────────
+        _lock           = threading.Lock(),
+    )
+
+def ensure_symbols(shared, symbols):
+    """Add any missing symbols to the shared store (idempotent)."""
+    for s in symbols:
+        if s not in shared["store"]:
+            shared["store"][s]          = new_store()
+            shared["top3_freq"][s]      = 0
+            shared["top3_last_rank"][s] = 0
+            shared["hof_strength"][s]   = {}
 
 # ══════════════════════════════════════════════════════
-#  CACHED RESOURCES
+#  DAY RESET
+#  Called once per render.  Clears spike logs and all
+#  tick data at the start of each new trading day.
+# ══════════════════════════════════════════════════════
+def maybe_reset_day(shared, symbols):
+    today = ist_now().date()
+    if shared["last_session_date"] == today:
+        return  # already reset for today
+    # New trading day detected
+    with shared["_lock"]:
+        shared["signal_log"]        = []
+        shared["strong_buy_log"]    = []
+        shared["tick"]              = 0
+        shared["last_fetch_ts"]     = None
+        shared["last_results"]      = []
+        shared["top3_freq"]         = {s: 0 for s in symbols}
+        shared["top3_last_rank"]    = {s: 0 for s in symbols}
+        shared["hof_strength"]      = {s: {} for s in symbols}
+        shared["store"]             = {s: new_store() for s in symbols}
+        shared["last_session_date"] = today
+
+# ══════════════════════════════════════════════════════
+#  CACHED API + STOCK LIST
 # ══════════════════════════════════════════════════════
 @st.cache_resource
 def load_api():
@@ -376,23 +378,24 @@ def load_stocks():
     df["token"] = df["token"].astype(int).astype(str)
     return df
 
-def init_state(symbols):
-    if "store" not in st.session_state:
-        st.session_state.store          = {s: new_store() for s in symbols}
-        st.session_state.tick           = 0
-        st.session_state.top3_freq      = {s: 0 for s in symbols}
-        st.session_state.top3_last_rank = {s: 0 for s in symbols}
-        st.session_state.hof_strength   = {s: {} for s in symbols}
-        st.session_state.last_results   = []
-        st.session_state.last_ts        = dt.datetime.now()
-
-
 # ══════════════════════════════════════════════════════
-#  FETCH
+#  FETCH  — gated: runs at most once per REFRESH_SEC
+#
+#  The FIRST user whose rerun arrives after the gate
+#  window does the actual API calls.  Everyone else
+#  (including mobile viewers) just skips and re-renders.
 # ══════════════════════════════════════════════════════
-def fetch_all(obj, batches, t2s):
-    now = dt.datetime.now()
-    S   = st.session_state.store
+def fetch_if_due(obj, batches, t2s, shared):
+    now = ist_now()
+    with shared["_lock"]:
+        last = shared["last_fetch_ts"]
+        if last is not None:
+            elapsed = (now - last).total_seconds()
+            if elapsed < REFRESH_SEC:
+                return False  # too soon — skip
+        shared["last_fetch_ts"] = now   # claim the slot
+
+    S = shared["store"]
     for batch in batches:
         try:
             time.sleep(0.4)
@@ -411,49 +414,51 @@ def fetch_all(obj, batches, t2s):
                 d["prev_close"] = item.get("close", d["prev_close"])
                 delta  = max(0, cum - d["cum"][-1]) if d["cum"] else 0
                 pdelta = (ltp - d["price"][-1])     if d["price"] else 0.0
-                ppct   = pdelta / d["price"][-1] * 100 if d["price"] else 0.0
+                ppct   = pdelta/d["price"][-1]*100  if d["price"] else 0.0
                 if d["open_price"] is None: d["open_price"] = ltp
                 b = bucket(ltp)
-                d["accum_zones"][b] = d["accum_zones"].get(b, 0) + delta
-                d["vwap_num"] += ltp * delta
+                d["accum_zones"][b] = d["accum_zones"].get(b,0) + delta
+                d["vwap_num"] += ltp*delta
                 d["vwap_den"] += delta
                 if pdelta>0:   d["up_ticks"]+=1; d["down_ticks"]=0
                 elif pdelta<0: d["down_ticks"]+=1; d["up_ticks"]=0
-                for k, v in [("cum",cum),("delta",delta),("price",ltp),
-                              ("price_delta",pdelta),("price_pct",ppct)]:
+                for k,v in [("cum",cum),("delta",delta),("price",ltp),
+                             ("price_delta",pdelta),("price_pct",ppct)]:
                     d[k].append(v); d[k] = d[k][-30:]
         except Exception as e:
             st.toast(f"Batch error: {e}", icon="⚠️")
-    return now
 
+    with shared["_lock"]:
+        shared["tick"] += 1
+    return True
 
 # ══════════════════════════════════════════════════════
 #  RANK / SCORE
 # ══════════════════════════════════════════════════════
 def _append_hist(d, z=0, score=0, vg=0):
-    d["z_spike_hist"].append(z);  d["z_spike_hist"]  = d["z_spike_hist"][-10:]
-    d["score_hist"].append(score);d["score_hist"]    = d["score_hist"][-10:]
-    d["vwap_gap_hist"].append(vg);d["vwap_gap_hist"] = d["vwap_gap_hist"][-10:]
+    d["z_spike_hist"].append(z);   d["z_spike_hist"]  = d["z_spike_hist"][-10:]
+    d["score_hist"].append(score); d["score_hist"]    = d["score_hist"][-10:]
+    d["vwap_gap_hist"].append(vg); d["vwap_gap_hist"] = d["vwap_gap_hist"][-10:]
 
-def rank_stocks(symbols):
+def rank_stocks(symbols, shared):
     results = []
-    now     = dt.datetime.now()
-    S       = st.session_state.store
+    now     = ist_now()
+    S       = shared["store"]
 
     for sym in symbols:
         d = S[sym]
         if len(d["delta"]) < WARMUP_TICKS+1 or not d["price"]: continue
         cv  = d["delta"][-1]; cp = d["price_pct"][-1]; ltp = d["price"][-1]
-        bv  = d["delta"][:-3]    if len(d["delta"])    > 3 else d["delta"][:-1]
-        bp  = d["price_pct"][:-3] if len(d["price_pct"]) > 3 else d["price_pct"][:-1]
+        bv  = d["delta"][:-3]     if len(d["delta"])    > 3 else d["delta"][:-1]
+        bp  = d["price_pct"][:-3] if len(d["price_pct"])> 3 else d["price_pct"][:-1]
         mv, _ = mean_std(bv)
-        ratio  = cv / mv if mv > 0 else 0
+        ratio  = cv/mv if mv > 0 else 0
 
         if ratio < GATE_VOL_RATIO:
-            d["gate_fail_reason"] = f"G1 {ratio:.1f}×"; d["elevated_streak"] = 0
+            d["gate_fail_reason"] = f"G1 {ratio:.1f}×"; d["elevated_streak"]=0
             _append_hist(d); continue
         if cv < GATE_VOL_ABS:
-            d["gate_fail_reason"] = f"G2 {cv}"; d["elevated_streak"] = 0
+            d["gate_fail_reason"] = f"G2 {cv}"; d["elevated_streak"]=0
             _append_hist(d); continue
         d["elevated_streak"] = d["elevated_streak"]+1 if ratio>=2.0 else 0
         if d["elevated_streak"] < GATE_ELEV_TICKS:
@@ -468,25 +473,25 @@ def rank_stocks(symbols):
             d["trigger_time"]  = now.strftime("%H:%M:%S")
             d["trigger_price"] = ltp
 
-        w30     = [sum(d["delta"][i:i+3]) for i in range(len(d["delta"])-3)]
-        a30     = sum(d["delta"][-3:])
-        za      = max(0, z_score(a30, w30)) if len(w30) >= 3 else 0
-        zp      = z_score(cp, bp) if len(bp) >= 3 else 0
-        pm      = max(0.1, 1+zp*0.4)
-        op      = d["open_price"] or ltp
-        dc      = ((ltp-op)/op*100) if op else 0
-        vv      = vwap_calc(d)
-        vg      = ((ltp-vv)/vv*100) if vv > 0 else 0
-        tz      = top_accum_zone(d["accum_zones"], 3)
-        tzp     = tz[0][0] if tz else 0
-        aa      = abs(ltp-tzp) <= PRICE_BUCKET*2
-        ab      = 1.3 if aa else 1.0
-        l3v     = d["delta"][-3:];       l3p = d["price_delta"][-3:]
-        va      = (1.5 if len(l3v)==3 and l3v[0]<l3v[1]<l3v[2]
-                   else 1.2 if len(l3v)>=2 and l3v[-2]<l3v[-1] else 1.0)
-        pu      = all(x>0 for x in l3p[-2:]) if len(l3p)>=2 else False
-        accel   = va * (1.2 if pu else 0.9)
-        is_surge= zs>2 and cp>=0
+        w30  = [sum(d["delta"][i:i+3]) for i in range(len(d["delta"])-3)]
+        a30  = sum(d["delta"][-3:])
+        za   = max(0, z_score(a30, w30)) if len(w30)>=3 else 0
+        zp   = z_score(cp, bp) if len(bp)>=3 else 0
+        pm   = max(0.1, 1+zp*0.4)
+        op   = d["open_price"] or ltp
+        dc   = ((ltp-op)/op*100) if op else 0
+        vv   = vwap_calc(d)
+        vg   = ((ltp-vv)/vv*100) if vv > 0 else 0
+        tz   = top_accum_zone(d["accum_zones"], 3)
+        tzp  = tz[0][0] if tz else 0
+        aa   = abs(ltp-tzp) <= PRICE_BUCKET*2
+        ab   = 1.3 if aa else 1.0
+        l3v  = d["delta"][-3:]; l3p = d["price_delta"][-3:]
+        va   = (1.5 if len(l3v)==3 and l3v[0]<l3v[1]<l3v[2]
+                else 1.2 if len(l3v)>=2 and l3v[-2]<l3v[-1] else 1.0)
+        pu   = all(x>0 for x in l3p[-2:]) if len(l3p)>=2 else False
+        accel= va*(1.2 if pu else 0.9)
+        is_surge = zs>2 and cp>=0
         if is_surge:
             d["sustained"]+=1; d["total_hold_secs"]+=REFRESH_SEC
             if d["surge_start"] is None: d["surge_start"]=now
@@ -503,17 +508,31 @@ def rank_stocks(symbols):
         cd_check,_,_,_ = candle_direction(d["price"], CANDLE_TICKS)
         if cd_check == 'red': fs = 0.0
         cc, pci, cci = two_candle_confirm(d["price"])
-        sh   = d["score_hist"]
-        sr   = (len(sh)>=2 and fs>sh[-1] and (len(sh)<3 or sh[-1]>=sh[-2]))
-        rh   = max(d["price"][-10:]) if len(d["price"])>=10 else ltp
-        ah   = ltp >= rh*0.999
-        vgh  = d["vwap_gap_hist"]
-        ve   = len(vgh)>=2 and vg>0 and vg>vgh[-1]
+        sh  = d["score_hist"]
+        sr  = (len(sh)>=2 and fs>sh[-1] and (len(sh)<3 or sh[-1]>=sh[-2]))
+        rh  = max(d["price"][-10:]) if len(d["price"])>=10 else ltp
+        ah  = ltp >= rh*0.999
+        vgh = d["vwap_gap_hist"]
+        ve  = len(vgh)>=2 and vg>0 and vg>vgh[-1]
         _append_hist(d, z=zs, score=fs, vg=vg)
         sig,sc,cdir,co_,cc_,cpct = compute_signal(fs,d["price_delta"],d["price"],zs,ratio,vg,cc,sr,ah,ve)
         d["last_signal"] = sig
         tp_ = d["trigger_price"]
         tc_ = round((ltp-tp_)/tp_*100, 2) if tp_ else 0
+
+        checks = indicator_checks_raw(dict(
+            ratio=ratio, cur_vol=cv, elevated_streak=d["elevated_streak"],
+            roc=round(roc,2), candle_dir=cdir, candle_open=co_, candle_close=cc_,
+            candle_pct=round(cpct,3), candle_confirmed=cc,
+            prev_c_open=pci.get("open",0), prev_c_close=pci.get("close",0),
+            prev_c_low=pci.get("low",0), curr_c_open=cci.get("open",0),
+            curr_c_close=cci.get("close",0), curr_c_low=cci.get("low",0),
+            higher_low=cci.get("higher_low",False), higher_close=cci.get("higher_close",False),
+            score_rising=sr, at_high=ah, vwap_expanding=ve,
+            z_spike=zs, vwap_gap=vg, vwap=vv, at_accum=aa,
+            top_zones=tz, accel=accel, price=ltp,
+        ))
+
         results.append(dict(
             sym=sym, score=fs, signal=sig, signal_color=sc,
             z_spike=zs, z_accum=za, ratio=ratio, cur_vol=cv, avg_vol=mv,
@@ -527,58 +546,216 @@ def rank_stocks(symbols):
             curr_c_open=cci.get("open",0),  curr_c_close=cci.get("close",0), curr_c_low=cci.get("low",0),
             higher_low=cci.get("higher_low",False), higher_close=cci.get("higher_close",False),
             score_rising=sr, at_high=ah, vwap_expanding=ve,
-            day_open=d["day_open"], day_high=d["day_high"], day_low=d["day_low"], prev_close=d["prev_close"],
+            day_open=d["day_open"], day_high=d["day_high"],
+            day_low=d["day_low"], prev_close=d["prev_close"],
             top_zones=tz, at_accum=aa, accum_bonus=ab,
             age=age, sustained=d["sustained"], total_hold=d["total_hold_secs"],
             first_seen=d["first_surge"].strftime("%H:%M:%S") if d["first_surge"] else "—",
             freshness=fr, accel=accel, price_multiplier=pm,
             trigger_time=d["trigger_time"], trigger_price=tp_, trigger_chg=tc_,
+            checks=checks,
         ))
+
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
+# ══════════════════════════════════════════════════════
+#  SPIKE LOG UPDATE
+#  Called after rank_stocks.  Appends to shared logs
+#  only on first appearance or signal upgrade.
+# ══════════════════════════════════════════════════════
+_SIGNAL_RANK = {
+    "⬜ NEUTRAL": 0, "🔴 DIST": 1, "🔴 DIST (red)": 1,
+    "🔵 WEAK": 2, "🔷 WATCH ↑": 3, "🔶 BUY? (mixed)": 4,
+    "🟢 STRONG BUY": 5,
+}
+
+def update_spike_logs(results, shared):
+    now_str = ist_now().strftime("%H:%M:%S")
+    S       = shared["store"]
+
+    with shared["_lock"]:
+        for r in results:
+            sym = r["sym"]
+            d   = S[sym]
+            prev_sig = d["last_logged_signal"]
+            cur_sig  = r["signal"]
+
+            # Determine if this is a new/upgraded signal worth logging
+            is_new     = (prev_sig == "")
+            is_upgrade = (_SIGNAL_RANK.get(cur_sig, 0) > _SIGNAL_RANK.get(prev_sig, 0))
+
+            if not (is_new or is_upgrade):
+                continue
+
+            d["last_logged_signal"] = cur_sig
+
+            entry = dict(
+                time          = now_str,
+                sym           = sym,
+                signal        = cur_sig,
+                signal_color  = r["signal_color"],
+                score         = round(r["score"], 1),
+                price         = r["price"],
+                trigger_price = r["trigger_price"] or r["price"],
+                trigger_chg   = r["trigger_chg"],
+                z_spike       = round(r["z_spike"], 1),
+                ratio         = round(r["ratio"], 1),
+                vwap_gap      = round(r["vwap_gap"], 2),
+                candle_dir    = r["candle_dir"],
+                checks_passed = sum(1 for c in r["checks"] if c[1]),
+                checks_total  = len(r["checks"]),
+            )
+
+            # Prepend (newest first)
+            shared["signal_log"].insert(0, entry)
+
+            if "STRONG BUY" in cur_sig:
+                shared["strong_buy_log"].insert(0, entry)
+
+        # Safety cap — keep at most 500 entries (full day is unlikely to exceed this)
+        shared["signal_log"]      = shared["signal_log"][:500]
+        shared["strong_buy_log"]  = shared["strong_buy_log"][:200]
 
 # ══════════════════════════════════════════════════════
-#  INDICATOR CHECKS
+#  INDICATOR CHECKS  (used in rank_stocks + tooltip)
 # ══════════════════════════════════════════════════════
-def indicator_checks(r):
+def indicator_checks_raw(r):
     cd = r["candle_dir"]
     return [
-        (f"G1 Vol ratio ≥ {GATE_VOL_RATIO}×", r["ratio"]>=GATE_VOL_RATIO,
-         f"{r['ratio']:.1f}× session avg", "volume"),
-        (f"G2 Abs vol ≥ {fmt(GATE_VOL_ABS)}/tick", r["cur_vol"]>=GATE_VOL_ABS,
-         f"This tick: {fmt(r['cur_vol'])} shares", "volume"),
-        (f"G3 Consecutive ≥ {GATE_ELEV_TICKS} elevated ticks", r["elevated_streak"]>=GATE_ELEV_TICKS,
-         f"{r['elevated_streak']} ticks in a row", "volume"),
-        (f"G4 Momentum ROC ≥ {GATE_ROC}×", r["roc"]>=GATE_ROC,
-         f"ROC = {r['roc']:.2f}×", "volume"),
-        ("S1a Current 60s candle GREEN", cd=='green',
+        (f"G1 Vol ratio ≥ {GATE_VOL_RATIO}×",       r["ratio"]>=GATE_VOL_RATIO,
+         f"{r['ratio']:.1f}× session avg",           "volume"),
+        (f"G2 Abs vol ≥ {fmt(GATE_VOL_ABS)}/tick",  r["cur_vol"]>=GATE_VOL_ABS,
+         f"This tick: {fmt(r['cur_vol'])} shares",   "volume"),
+        (f"G3 Consec ≥ {GATE_ELEV_TICKS} elevated",  r["elevated_streak"]>=GATE_ELEV_TICKS,
+         f"{r['elevated_streak']} ticks",            "volume"),
+        (f"G4 ROC ≥ {GATE_ROC}×",                   r["roc"]>=GATE_ROC,
+         f"ROC = {r['roc']:.2f}×",                  "volume"),
+        ("S1a Current candle GREEN",                  cd=='green',
          f"₹{r['candle_open']:.2f}→₹{r['candle_close']:.2f} ({r['candle_pct']:+.3f}%)", "price"),
-        ("S1b Two green candles + higher low", r["candle_confirmed"],
-         f"Prev ₹{r['prev_c_open']:.2f}→{r['prev_c_close']:.2f}  Curr ₹{r['curr_c_open']:.2f}→{r['curr_c_close']:.2f}  HL:{'✅' if r['higher_low'] else '❌'}", "price"),
-        ("S2 Score rising 3 ticks", r["score_rising"],
-         "↑ accelerating ✅" if r["score_rising"] else "→↓ flat/fading ❌", "price"),
-        ("S3 Price at/near 10-tick high", r["at_high"],
-         f"LTP ₹{r['price']:.2f} {'at breakout ✅' if r['at_high'] else 'below high ❌'}", "price"),
-        ("S4 VWAP gap expanding", r["vwap_expanding"],
+        ("S1b Two candles + higher low",              r["candle_confirmed"],
+         f"Prev ₹{r['prev_c_open']:.2f}→{r['prev_c_close']:.2f}  "
+         f"Curr ₹{r['curr_c_open']:.2f}→{r['curr_c_close']:.2f}  "
+         f"HL:{'✅' if r['higher_low'] else '❌'}",  "price"),
+        ("S2 Score rising 3 ticks",                   r["score_rising"],
+         "↑ accelerating" if r["score_rising"] else "→↓ flat/fading", "price"),
+        ("S3 Price at/near 10-tick high",             r["at_high"],
+         f"₹{r['price']:.2f} {'at breakout' if r['at_high'] else 'below high'}", "price"),
+        ("S4 VWAP gap expanding",                     r["vwap_expanding"],
          f"Gap {r['vwap_gap']:+.3f}% vs VWAP ₹{r['vwap']:.2f}", "confluence"),
-        ("High vol + GREEN candle", r["z_spike"]>2 and cd=='green',
-         "✅ buyers absorbing" if r["z_spike"]>2 and cd=='green' else "❌ red candle = sellers", "confluence"),
-        ("Price AT accumulation zone", r["at_accum"],
+        ("High vol + GREEN candle",                   r["z_spike"]>2 and cd=='green',
+         "buyers absorbing" if r["z_spike"]>2 and cd=='green' else "red candle=sellers", "confluence"),
+        ("Price AT accumulation zone",                r["at_accum"],
          f"Top zone ₹{r['top_zones'][0][0]:.1f}" if r["top_zones"] else "Building...", "confluence"),
-        ("Volume accelerating", r["accel"]>1.1,
-         f"Accel = {r['accel']:.2f}", "confluence"),
-        ("Price above VWAP", r["vwap_gap"]>0,
-         f"{r['vwap_gap']:+.3f}% vs VWAP", "confluence"),
+        ("Volume accelerating",                       r["accel"]>1.1,
+         f"Accel = {r['accel']:.2f}",               "confluence"),
+        ("Price above VWAP",                          r["vwap_gap"]>0,
+         f"{r['vwap_gap']:+.3f}% vs VWAP",         "confluence"),
     ]
 
+def indicator_checks(r):
+    return indicator_checks_raw(r)
 
 # ══════════════════════════════════════════════════════
-#  BUILD FULL HTML COMPONENT
+#  SPIKE LOG HTML  — newest on top, full day
+# ══════════════════════════════════════════════════════
+def build_spike_log_html(signal_log, strong_buy_log):
+    sb_count  = len(strong_buy_log)
+    all_count = len(signal_log)
+
+    def make_rows(entries):
+        if not entries:
+            return '<tr><td colspan="9" style="color:#333;padding:16px;text-align:center">No signals yet today</td></tr>'
+        rows = ""
+        for e in entries:
+            sc = e["signal_color"]
+            pc = "#69f0ae" if e["trigger_chg"] > 0 else "#ff5252" if e["trigger_chg"] < 0 else "#aaa"
+            ar = "▲" if e["trigger_chg"] > 0 else "▼" if e["trigger_chg"] < 0 else ""
+            cd_icon = "🟩" if e["candle_dir"]=="green" else "🟥" if e["candle_dir"]=="red" else "🟨"
+            chk_col = "#00e676" if e["checks_passed"]>=9 else "#FFD700" if e["checks_passed"]>=6 else "#ff5252"
+            rows += f"""<tr style="border-bottom:1px solid #0e0e18">
+              <td style="color:#555;padding:6px 8px;white-space:nowrap">{e['time']}</td>
+              <td style="color:#FFD700;font-weight:700;padding:6px 8px">{e['sym']}</td>
+              <td style="color:{sc};font-weight:700;padding:6px 8px;white-space:nowrap">{e['signal']}</td>
+              <td style="color:{sc};padding:6px 8px">{e['score']}</td>
+              <td style="color:#fff;padding:6px 8px">₹{e['price']:,.2f}</td>
+              <td style="color:{pc};padding:6px 8px">{ar}{abs(e['trigger_chg']):.2f}%</td>
+              <td style="color:#FFD700;padding:6px 8px">{e['z_spike']}σ</td>
+              <td style="color:#555;padding:6px 8px">{cd_icon}</td>
+              <td style="color:{chk_col};padding:6px 8px">{e['checks_passed']}/{e['checks_total']}</td>
+            </tr>"""
+        return rows
+
+    sb_rows  = make_rows(strong_buy_log)
+    all_rows = make_rows(signal_log)
+
+    return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;font-size:12px}}
+.tabs{{display:flex;gap:0;margin-bottom:0;border-bottom:2px solid #1a1a2a}}
+.tab{{padding:8px 16px;cursor:pointer;color:#555;font-size:11px;letter-spacing:.5px;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .2s}}
+.tab.active{{color:#FFD700;border-bottom-color:#FFD700}}
+.tab-panel{{display:none}}.tab-panel.active{{display:block}}
+.tbl-wrap{{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+table{{border-collapse:collapse;min-width:600px;width:100%}}
+thead th{{background:#0b0b12;color:#FFD700;padding:7px 8px;text-align:left;
+          border-bottom:2px solid #1e1e2e;font-size:10px;letter-spacing:.5px;
+          position:sticky;top:0;z-index:5;white-space:nowrap}}
+tr:hover{{background:#0f0f18}}
+td{{white-space:nowrap;font-size:12px}}
+.hdr{{display:flex;align-items:center;gap:12px;padding:10px 2px 10px;border-bottom:1px solid #141420;margin-bottom:0}}
+.badge{{padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700}}
+</style></head><body>
+
+<div class="hdr">
+  <span style="color:#FFD700;font-weight:700;font-size:13px">📋 Today's Spikes</span>
+  <span class="badge" style="background:#001a0a;color:#00e676">🟢 Strong Buys: {sb_count}</span>
+  <span class="badge" style="background:#0a0a18;color:#4fc3f7">📊 All Signals: {all_count}</span>
+  <span style="color:#333;font-size:10px;margin-left:auto">newest on top · IST</span>
+</div>
+
+<div class="tabs">
+  <div class="tab active"   id="t-sb"  onclick="switchTab('sb')">🟢 Strong Buys ({sb_count})</div>
+  <div class="tab"          id="t-all" onclick="switchTab('all')">📊 All Signals ({all_count})</div>
+</div>
+
+<div class="tab-panel active" id="p-sb">
+  <div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>TIME (IST)</th><th>SYMBOL</th><th>SIGNAL</th><th>SCORE</th>
+      <th>PRICE</th><th>vs TRIGGER</th><th>Z-VOL</th><th>CANDLE</th><th>CHECKS</th>
+    </tr></thead>
+    <tbody>{sb_rows}</tbody>
+  </table></div>
+</div>
+
+<div class="tab-panel" id="p-all">
+  <div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>TIME (IST)</th><th>SYMBOL</th><th>SIGNAL</th><th>SCORE</th>
+      <th>PRICE</th><th>vs TRIGGER</th><th>Z-VOL</th><th>CANDLE</th><th>CHECKS</th>
+    </tr></thead>
+    <tbody>{all_rows}</tbody>
+  </table></div>
+</div>
+
+<script>
+function switchTab(id){{
+  ['sb','all'].forEach(t=>{{
+    document.getElementById('t-'+t).classList.toggle('active',t===id);
+    document.getElementById('p-'+t).classList.toggle('active',t===id);
+  }});
+}}
+</script></body></html>"""
+
+# ══════════════════════════════════════════════════════
+#  MAIN TABLE HTML  (unchanged from v2, references shared)
 # ══════════════════════════════════════════════════════
 def build_html(results, ts, tick, hof, warming):
 
-    # ── Table rows ──────────────────────────────────────
     rows_html = ""
     for rank, r in enumerate(results, 1):
         label, color = strength_label(r["score"])
@@ -610,7 +787,7 @@ def build_html(results, ts, tick, hof, warming):
         else:
             trig_td = '<span style="color:#333">—</span>'
 
-        checks = indicator_checks(r)
+        checks = r["checks"]
         passed = sum(1 for c in checks if c[1])
         tip_data = dict(
             sym=r["sym"], score=round(r["score"],2), signal=r["signal"], sig_color=r["signal_color"],
@@ -678,13 +855,14 @@ def build_html(results, ts, tick, hof, warming):
           <td style="color:#ff9800;padding:7px 8px">{astr}</td>
         </tr>"""
 
-    # ── HOF cards ───────────────────────────────────────
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
     hof_cards = ""
     if hof:
         for i, (sym, cnt) in enumerate(hof[:5]):
-            is_live = st.session_state.top3_last_rank.get(sym, 0) > 0
-            st_info = st.session_state.hof_strength.get(sym, {})
+            is_live = False
+            for r in results:
+                if r["sym"] == sym: is_live = True; break
+            st_info = {}
             sc_     = st_info.get("score", 0)
             cdir_   = st_info.get("candle_dir", "doji")
             cicon   = "🟩" if cdir_=="green" else "🟥" if cdir_=="red" else "🟨"
@@ -706,7 +884,6 @@ def build_html(results, ts, tick, hof, warming):
         '<div style="color:#333;font-size:11px;padding:6px 0 10px">🏆 Hall of Fame — building after warmup...</div>'
     )
 
-    # ── Strong buy alert ────────────────────────────────
     sb_items = [r for r in results if "STRONG BUY" in r["signal"]]
     sb_html  = ""
     if sb_items:
@@ -723,8 +900,6 @@ def build_html(results, ts, tick, hof, warming):
         )
 
     strong_buy_json = json.dumps([r["sym"] for r in results if "STRONG BUY" in r["signal"]])
-
-    # ── Gate badges ────────────────────────────────────
     status_color = "#ff9800" if warming else "#00e676"
     status_text  = f"⏳ WARMING {tick}/{WARMUP_TICKS}" if warming else f"🟢 LIVE tick#{tick}"
 
@@ -732,88 +907,50 @@ def build_html(results, ts, tick, hof, warming):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <style>
-* {{ box-sizing:border-box;margin:0;padding:0 }}
-body {{ background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;font-size:12px }}
-
-/* Desktop tooltip */
-#tip {{ display:none;position:fixed;z-index:9999;background:#0c0c14;
-        border:1px solid #252535;border-radius:12px;padding:18px;
-        width:450px;font-size:12px;line-height:1.7;pointer-events:none;
-        box-shadow:0 12px 48px rgba(0,0,0,.95);max-height:90vh;overflow-y:auto }}
-
-/* Mobile bottom sheet */
-#overlay {{ display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:8000 }}
-#sheet {{
-  display:none;position:fixed;bottom:0;left:0;right:0;z-index:8001;
-  background:#0c0c14;border-top:2px solid #252535;
-  border-radius:16px 16px 0 0;padding:16px;
-  max-height:88vh;overflow-y:auto;
-  animation:up .25s ease-out
-}}
-@keyframes up {{ from{{transform:translateY(100%)}} to{{transform:translateY(0)}} }}
-#sheet-hdr {{
-  position:sticky;top:0;background:#0c0c14;
-  display:flex;justify-content:space-between;align-items:center;
-  padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid #1a1a2a;z-index:2
-}}
-
-/* Table */
-.tbl-wrap {{ width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;margin-bottom:4px }}
-table {{ border-collapse:collapse;min-width:760px;width:100% }}
-thead th {{
-  background:#0b0b12;color:#FFD700;padding:8px 8px;text-align:left;
-  border-bottom:2px solid #1e1e2e;font-size:10px;letter-spacing:.5px;
-  position:sticky;top:0;z-index:10;white-space:nowrap
-}}
-tr:hover {{ filter:brightness(1.6) }}
-td {{ white-space:nowrap }}
-
-/* Shared detail content */
-.tip-cards {{ display:flex;gap:8px;margin-bottom:10px }}
-.tip-card  {{ background:#111120;border-radius:6px;padding:8px 10px;flex:1;text-align:center }}
-.tc-lbl {{ color:#444;font-size:9px;letter-spacing:.5px }}
-.tc-val {{ font-size:14px;font-weight:700 }}
-.tc-sub {{ font-size:10px;color:#666;margin-top:1px }}
-.chk-row {{ display:flex;align-items:flex-start;gap:8px;padding:5px 0;border-bottom:1px solid #141420 }}
-.cat-hdr {{ font-size:9px;letter-spacing:1.2px;margin-top:10px;margin-bottom:4px }}
-.t2grid  {{ display:flex;gap:6px;margin-bottom:10px }}
-.t2cell  {{ background:#111120;border-radius:4px;padding:5px 7px;flex:1;text-align:center }}
-
-/* Gate pills */
-.gates {{ display:flex;gap:5px;flex-wrap:wrap;padding:6px 0 8px }}
-.gate  {{ padding:3px 7px;border-radius:4px;font-size:10px;font-weight:700 }}
-
-@media (max-width:600px) {{
-  #tip {{ display:none !important }}
-  .tc-val {{ font-size:13px }}
-  thead th {{ font-size:9px;padding:6px 5px }}
-}}
-</style>
-</head><body>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#060608;font-family:'JetBrains Mono','Courier New',monospace;color:#d0d0d8;font-size:12px}}
+#tip{{display:none;position:fixed;z-index:9999;background:#0c0c14;border:1px solid #252535;border-radius:12px;padding:18px;width:450px;font-size:12px;line-height:1.7;pointer-events:none;box-shadow:0 12px 48px rgba(0,0,0,.95);max-height:90vh;overflow-y:auto}}
+#overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:8000}}
+#sheet{{display:none;position:fixed;bottom:0;left:0;right:0;z-index:8001;background:#0c0c14;border-top:2px solid #252535;border-radius:16px 16px 0 0;padding:16px;max-height:88vh;overflow-y:auto;animation:up .25s ease-out}}
+@keyframes up{{from{{transform:translateY(100%)}}to{{transform:translateY(0)}}}}
+#sheet-hdr{{position:sticky;top:0;background:#0c0c14;display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid #1a1a2a;z-index:2}}
+.tbl-wrap{{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;margin-bottom:4px}}
+table{{border-collapse:collapse;min-width:760px;width:100%}}
+thead th{{background:#0b0b12;color:#FFD700;padding:8px 8px;text-align:left;border-bottom:2px solid #1e1e2e;font-size:10px;letter-spacing:.5px;position:sticky;top:0;z-index:10;white-space:nowrap}}
+tr:hover{{filter:brightness(1.6)}}
+td{{white-space:nowrap}}
+.tip-cards{{display:flex;gap:8px;margin-bottom:10px}}
+.tip-card{{background:#111120;border-radius:6px;padding:8px 10px;flex:1;text-align:center}}
+.tc-lbl{{color:#444;font-size:9px;letter-spacing:.5px}}
+.tc-val{{font-size:14px;font-weight:700}}
+.tc-sub{{font-size:10px;color:#666;margin-top:1px}}
+.chk-row{{display:flex;align-items:flex-start;gap:8px;padding:5px 0;border-bottom:1px solid #141420}}
+.cat-hdr{{font-size:9px;letter-spacing:1.2px;margin-top:10px;margin-bottom:4px}}
+.t2grid{{display:flex;gap:6px;margin-bottom:10px}}
+.t2cell{{background:#111120;border-radius:4px;padding:5px 7px;flex:1;text-align:center}}
+.gates{{display:flex;gap:5px;flex-wrap:wrap;padding:6px 0 8px}}
+.gate{{padding:3px 7px;border-radius:4px;font-size:10px;font-weight:700}}
+@media(max-width:600px){{#tip{{display:none!important}}.tc-val{{font-size:13px}}thead th{{font-size:9px;padding:6px 5px}}}}
+</style></head><body>
 
 <div id="tip"></div>
 <div id="overlay" onclick="closeSheet()"></div>
 <div id="sheet">
   <div id="sheet-hdr">
     <span id="sheet-sym" style="color:#FFD700;font-size:15px;font-weight:700"></span>
-    <button onclick="closeSheet()"
-      style="background:#1a1a2a;color:#aaa;border:1px solid #333;
-             border-radius:6px;padding:5px 14px;cursor:pointer;font-size:13px;
-             -webkit-tap-highlight-color:transparent">✕ Close</button>
+    <button onclick="closeSheet()" style="background:#1a1a2a;color:#aaa;border:1px solid #333;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:13px;-webkit-tap-highlight-color:transparent">✕ Close</button>
   </div>
   <div id="sheet-body"></div>
 </div>
 
-<!-- Status bar -->
 <div style="display:flex;align-items:center;gap:10px;padding:6px 2px 6px;flex-wrap:wrap;border-bottom:1px solid #141420;margin-bottom:6px">
   <span style="color:{status_color};font-weight:700;font-size:12px">{status_text}</span>
-  <span style="color:#444">{ts.strftime('%H:%M:%S')}</span>
+  <span style="color:#444">{ts.strftime('%H:%M:%S')} IST</span>
   <span style="color:#333">|</span>
   <span style="color:#555">{len(results)} stocks passed</span>
   <span style="color:#333;margin-left:auto;font-size:10px;font-style:italic">tap row for details</span>
 </div>
 
-<!-- Gate legend -->
 <div class="gates">
   <span class="gate" style="background:#1a1a24;color:#FFD700">HARD GATES:</span>
   <span class="gate" style="background:#001a0a;color:#69f0ae">G1 Vol≥{GATE_VOL_RATIO}×</span>
@@ -827,18 +964,14 @@ td {{ white-space:nowrap }}
   <span class="gate" style="background:#00101a;color:#4fc3f7">S4 VWAP↑</span>
 </div>
 
-<!-- HOF -->
 {hof_strip}
-
-<!-- Strong buy alert -->
 {sb_html}
 
-<!-- Main table -->
 <div class="tbl-wrap">
 <table>
   <thead><tr>
     <th>#</th><th>SYMBOL</th><th>SIGNAL</th><th>SCORE</th>
-    <th>PRICE/Δ%</th><th title="Time + price when all 4 gates first passed">TRIGGERED</th>
+    <th>PRICE/Δ%</th><th title="Time+price when all 4 gates first passed">TRIGGERED</th>
     <th>vsVWAP</th><th>Z-VOL</th><th>RATIO/ROC</th>
     <th>ACCUM ZONE</th><th>HOLD</th><th>AGE</th>
   </tr></thead>
@@ -846,39 +979,32 @@ td {{ white-space:nowrap }}
 </table>
 </div>
 
-<!-- Legend -->
 <div style="color:#333;font-size:10px;border-top:1px solid #141420;padding:6px 0;line-height:1.8;margin-top:4px">
-  🟢 STRONG BUY = all gates + S1–S4 &nbsp;|&nbsp; 🔷 WATCH = gates pass, tier-2 partial &nbsp;|&nbsp; 🔴 DIST = high vol + red candle<br>
-  TRIGGERED = time &amp; price when stock first passed all 4 hard gates · % move since
+  🟢 STRONG BUY = all gates + S1–S4 &nbsp;|&nbsp; 🔷 WATCH = gates pass, tier-2 partial &nbsp;|&nbsp; 🔴 DIST = high vol + red candle
 </div>
-
-<!-- Countdown -->
 <div style="color:#333;font-size:10px;text-align:right;padding:5px 0">
   Refreshing in <span id="ct">{REFRESH_SEC}</span>s
 </div>
 
 <script>
-const isMobile = () => window.innerWidth <= 640 || ('ontouchstart' in window);
-const CAT_COLOR = {{price:'#4fc3f7',volume:'#FFD700',confluence:'#cf6cc9'}};
-const CAT_LABEL = {{price:'📈 PRICE / CANDLE',volume:'📊 VOLUME / GATES',confluence:'🔗 CONFLUENCE'}};
+const isMobile=()=>window.innerWidth<=640||('ontouchstart' in window);
+const CAT_COLOR={{price:'#4fc3f7',volume:'#FFD700',confluence:'#cf6cc9'}};
+const CAT_LABEL={{price:'📈 PRICE / CANDLE',volume:'📊 VOLUME / GATES',confluence:'🔗 CONFLUENCE'}};
 
-function buildDetail(d) {{
-  const sp = Math.min(100,(d.score/25)*100).toFixed(0);
-  const cats = {{price:[],volume:[],confluence:[]}};
-  d.checks.forEach(c => cats[c.cat].push(c));
-  const renderCat = key => {{
-    const items = cats[key]; if(!items.length) return '';
-    return `<div class="cat-hdr" style="color:${{CAT_COLOR[key]}}">${{CAT_LABEL[key]}}</div>`
-      + items.map(c => `<div class="chk-row">
-          <span style="font-size:13px">${{c.pass?'✅':'❌'}}</span>
-          <div>
-            <div style="color:${{c.pass?'#ddd':'#444'}};font-size:12px;font-weight:700">${{c.label}}</div>
-            <div style="color:${{c.pass?'#777':'#333'}};font-size:11px">${{c.detail}}</div>
-          </div></div>`).join('');
+function buildDetail(d){{
+  const sp=Math.min(100,(d.score/25)*100).toFixed(0);
+  const cats={{price:[],volume:[],confluence:[]}};
+  d.checks.forEach(c=>cats[c.cat].push(c));
+  const renderCat=key=>{{
+    const items=cats[key];if(!items.length)return'';
+    return`<div class="cat-hdr" style="color:${{CAT_COLOR[key]}}">${{CAT_LABEL[key]}}</div>`
+      +items.map(c=>`<div class="chk-row">
+        <span style="font-size:13px">${{c.pass?'✅':'❌'}}</span>
+        <div><div style="color:${{c.pass?'#ddd':'#444'}};font-size:12px;font-weight:700">${{c.label}}</div>
+        <div style="color:${{c.pass?'#777':'#333'}};font-size:11px">${{c.detail}}</div></div></div>`).join('');
   }};
-
-  const cc = d.candle_confirmed;
-  const twoC = `<div style="background:#0a0a12;border:1px solid ${{cc?'#00e676':'#333'}}44;border-radius:6px;padding:8px;margin-bottom:10px">
+  const cc=d.candle_confirmed;
+  const twoC=`<div style="background:#0a0a12;border:1px solid ${{cc?'#00e676':'#333'}}44;border-radius:6px;padding:8px;margin-bottom:10px">
     <div style="color:#444;font-size:10px;margin-bottom:6px">TWO-CANDLE (S1) ${{cc?'✅ CONFIRMED':'❌ NOT CONFIRMED'}}</div>
     <div style="display:flex;gap:8px">
       <div class="tip-card"><div class="tc-lbl">PREV</div>
@@ -891,13 +1017,10 @@ function buildDetail(d) {{
         <div class="tc-val" style="font-size:11px;color:${{d.higher_low?'#00e676':'#ff5252'}}">${{d.higher_low?'↗HL✅':'↘LL❌'}}</div>
         <div class="tc-sub" style="color:${{d.higher_close?'#00e676':'#ff5252'}}">${{d.higher_close?'↗HC✅':'↘LC❌'}}</div>
       </div></div></div>`;
-
-  const t2 = [['S1 2C-HL',d.candle_confirmed],['S2 Score↑',d.score_rising],['S3 High',d.at_high],['S4 VWAP↑',d.vwap_expanding]];
-  const t2html = '<div class="t2grid">' + t2.map(([l,ok])=>
-    `<div class="t2cell">
-      <div style="color:${{ok?'#00e676':'#555'}};font-size:12px">${{ok?'✅':'❌'}}</div>
-      <div style="color:#555;font-size:9px;margin-top:2px">${{l}}</div></div>`).join('') + '</div>';
-
+  const t2=[['S1 2C-HL',d.candle_confirmed],['S2 Score↑',d.score_rising],['S3 High',d.at_high],['S4 VWAP↑',d.vwap_expanding]];
+  const t2html='<div class="t2grid">'+t2.map(([l,ok])=>`<div class="t2cell">
+    <div style="color:${{ok?'#00e676':'#555'}};font-size:12px">${{ok?'✅':'❌'}}</div>
+    <div style="color:#555;font-size:9px;margin-top:2px">${{l}}</div></div>`).join('')+'</div>';
   const volOk=d.z_spike>2&&d.ratio>={GATE_VOL_RATIO};
   const allS=d.score>=12&&d.candle_confirmed&&d.score_rising&&d.at_high;
   let verdict='';
@@ -906,31 +1029,27 @@ function buildDetail(d) {{
   else if(volOk&&d.candle_dir==='red')
     verdict=`<div style="background:#1a0000;border:1px solid #ff1744;border-radius:6px;padding:8px 10px;color:#ff5252;font-size:12px;margin-bottom:10px">⚠️ <b>HIGH VOL + RED CANDLE = SELLING PRESSURE</b></div>`;
   else if(!d.candle_confirmed)
-    verdict=`<div style="background:#0d100a;border:1px solid #4fc3f7;border-radius:6px;padding:8px 10px;color:#4fc3f7;font-size:12px;margin-bottom:10px">🔷 <b>WATCH — Waiting for 2-candle confirmation (S1)</b></div>`;
+    verdict=`<div style="background:#0d100a;border:1px solid #4fc3f7;border-radius:6px;padding:8px 10px;color:#4fc3f7;font-size:12px;margin-bottom:10px">🔷 <b>WATCH — Waiting for 2-candle confirmation</b></div>`;
   else if(!d.score_rising)
     verdict=`<div style="background:#0d100a;border:1px solid #ff9800;border-radius:6px;padding:8px 10px;color:#ff9800;font-size:12px;margin-bottom:10px">🔶 <b>WATCH — Score not rising (S2 fail)</b></div>`;
   else
     verdict=`<div style="background:#111;border:1px solid #222;border-radius:6px;padding:8px 10px;color:#444;font-size:12px;margin-bottom:10px">Some conditions unmet — see checks below.</div>`;
-
   const tca=d.trigger_chg>0?'#69f0ae':d.trigger_chg<0?'#ff5252':'#aaa';
   const tar=d.trigger_chg>0?'▲':d.trigger_chg<0?'▼':'';
-  const trigB = d.trigger_time!=='—'
+  const trigB=d.trigger_time!=='—'
     ?`<div style="background:#0a0a12;border:1px solid #1e3a1e;border-radius:6px;padding:8px 12px;margin-bottom:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
         <div><div style="color:#444;font-size:9px">🎯 TRIGGERED</div><div style="color:#aaa;font-size:14px;font-weight:700">${{d.trigger_time}}</div></div>
         <div><div style="color:#444;font-size:9px">AT PRICE</div><div style="color:#fff;font-size:14px;font-weight:700">₹${{Number(d.trigger_price).toLocaleString('en-IN')}}</div></div>
         <div><div style="color:#444;font-size:9px">MOVE SINCE</div><div style="color:${{tca}};font-size:14px;font-weight:700">${{tar}}${{Math.abs(d.trigger_chg).toFixed(2)}}%</div></div>
       </div>`:'';
-
   const zones=d.top_zones.map((z,i)=>{{
     const col=(i===0&&d.at_accum)?'#FFD700':'#555';
     const star=(i===0&&d.at_accum)?'⭐':'#'+(i+1);
-    return `<span style="color:${{col}};margin-right:10px">${{star}} ₹${{z[0]}} (${{z[1]}})</span>`;
+    return`<span style="color:${{col}};margin-right:10px">${{star}} ₹${{z[0]}} (${{z[1]}})</span>`;
   }}).join('');
-
   const pC=v=>v>0?'#69f0ae':v<0?'#ff5252':'#aaa';
   const zC=v=>v>=5?'#ff1744':v>=2?'#FFD700':'#69f0ae';
-
-  return `
+  return`
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
       <h3 style="color:#FFD700;font-size:16px">${{d.sym}}</h3>
       <span style="color:${{d.sig_color}};font-size:13px;font-weight:700">${{d.signal}}</span>
@@ -966,60 +1085,50 @@ function buildDetail(d) {{
     </div>`;
 }}
 
-/* Desktop tooltip */
-const tip = document.getElementById('tip');
-function showTip(row) {{
-  if(isMobile()) return;
-  const d = JSON.parse(row.dataset.tip.replace(/&quot;/g,'"'));
-  tip.innerHTML = buildDetail(d);
-  const r = row.getBoundingClientRect();
-  let left=r.right+12, top=r.top+window.scrollY-10;
-  if(left+460>window.innerWidth) left=r.left-462;
-  if(top+820>window.innerHeight+window.scrollY) top=Math.max(0,window.innerHeight+window.scrollY-830);
+const tip=document.getElementById('tip');
+function showTip(row){{
+  if(isMobile())return;
+  const d=JSON.parse(row.dataset.tip.replace(/&quot;/g,'"'));
+  tip.innerHTML=buildDetail(d);
+  const r=row.getBoundingClientRect();
+  let left=r.right+12,top=r.top+window.scrollY-10;
+  if(left+460>window.innerWidth)left=r.left-462;
+  if(top+820>window.innerHeight+window.scrollY)top=Math.max(0,window.innerHeight+window.scrollY-830);
   Object.assign(tip.style,{{top:top+'px',left:left+'px',display:'block'}});
 }}
-function hideTip() {{ tip.style.display='none'; }}
-
-/* Mobile bottom sheet */
-function openSheet(row) {{
-  const d = JSON.parse(row.dataset.tip.replace(/&quot;/g,'"'));
-  document.getElementById('sheet-sym').textContent = d.sym;
-  document.getElementById('sheet-body').innerHTML  = buildDetail(d);
-  document.getElementById('overlay').style.display = 'block';
-  document.getElementById('sheet').style.display   = 'block';
-  document.body.style.overflow = 'hidden';
+function hideTip(){{tip.style.display='none'}}
+function openSheet(row){{
+  const d=JSON.parse(row.dataset.tip.replace(/&quot;/g,'"'));
+  document.getElementById('sheet-sym').textContent=d.sym;
+  document.getElementById('sheet-body').innerHTML=buildDetail(d);
+  document.getElementById('overlay').style.display='block';
+  document.getElementById('sheet').style.display='block';
+  document.body.style.overflow='hidden';
 }}
-function closeSheet() {{
+function closeSheet(){{
   document.getElementById('overlay').style.display='none';
   document.getElementById('sheet').style.display='none';
   document.body.style.overflow='';
 }}
-
-/* Attach click/tap to every row */
-document.querySelectorAll('tbody tr').forEach(tr => {{
-  tr.addEventListener('click', () => {{
-    if(isMobile()) openSheet(tr); else showTip(tr);
-  }});
+document.querySelectorAll('tbody tr').forEach(tr=>{{
+  tr.addEventListener('click',()=>{{if(isMobile())openSheet(tr);else showTip(tr)}});
 }});
 
-/* Countdown → auto reload */
 let secs={REFRESH_SEC};
 const ct=document.getElementById('ct');
 const iv=setInterval(()=>{{
-  secs--;
-  if(ct) ct.textContent=secs;
-  if(secs<=0){{ clearInterval(iv); window.parent.location.reload(); }}
+  secs--;if(ct)ct.textContent=secs;
+  if(secs<=0){{clearInterval(iv);window.parent.location.reload()}}
 }},1000);
 
-/* Strong buy popup */
-const SB = {strong_buy_json};
+const SB={strong_buy_json};
 (function(){{
-  try {{
-    const seen = JSON.parse(sessionStorage.getItem('seen_sb')||'[]');
-    const nw   = SB.filter(s=>!seen.includes(s));
+  try{{
+    const seen=JSON.parse(sessionStorage.getItem('seen_sb')||'[]');
+    const nw=SB.filter(s=>!seen.includes(s));
     if(nw.length){{
       sessionStorage.setItem('seen_sb',JSON.stringify([...new Set([...seen,...SB])]));
-      const pop = document.createElement('div');
+      const pop=document.createElement('div');
       pop.style.cssText='position:fixed;top:16px;right:16px;z-index:99999;background:#001a0a;border:2px solid #00e676;border-radius:10px;padding:14px 16px;min-width:200px;font-family:monospace;box-shadow:0 0 30px #00e67655;font-size:13px;color:#ddd';
       pop.innerHTML=`<div style="color:#00e676;font-weight:700;margin-bottom:8px">🚨 NEW STRONG BUY${{nw.length>1?'S':''}}</div>`
         +nw.map(s=>`<div style="color:#fff;font-size:15px;font-weight:700;margin-bottom:4px">${{s}}</div>`).join('')
@@ -1027,36 +1136,27 @@ const SB = {strong_buy_json};
       document.body.appendChild(pop);
       setTimeout(()=>pop.remove(),15000);
     }}
-    if(!SB.length) sessionStorage.removeItem('seen_sb');
+    if(!SB.length)sessionStorage.removeItem('seen_sb');
   }}catch(e){{}}
 }})();
-</script>
-</body></html>"""
-
+</script></body></html>"""
 
 # ══════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════
 def main():
-    # ══ MARKET HOURS GATE ════════════════════════════
-    # Show a countdown screen when NSE is closed.
-    # The JS inside the component reloads the parent
-    # every CLOSED_RECHECK_SEC seconds, so when the
-    # market finally opens this page auto-transitions.
+    import streamlit.components.v1 as components
+
+    # ── Market hours gate ─────────────────────────────
     if not is_market_open():
-        import streamlit.components.v1 as components
         next_open = next_market_open()
         st.markdown(
             '<h2 style="font-family:JetBrains Mono,monospace;color:#FFD700;'
             'font-size:clamp(14px,3vw,20px);margin:0 0 8px;letter-spacing:1px">'
-            '⚡ SB Momentum Radar </h2>',
+            '⚡ SB Momentum Radar</h2>',  # name
             unsafe_allow_html=True,
         )
-        components.html(
-            closed_screen_html(next_open),
-            height=480,
-            scrolling=False,
-        )
+        components.html(closed_screen_html(next_open), height=480, scrolling=False)
         st.markdown(
             f'<div style="color:#333;font-size:11px;text-align:center;margin-top:6px;'
             f'font-family:JetBrains Mono,monospace">'
@@ -1064,68 +1164,77 @@ def main():
             f'Next open: {next_open.strftime("%a %d %b %H:%M IST")}</div>',
             unsafe_allow_html=True,
         )
-        # Also add a manual refresh button in case the user wants to force-check
         if st.button("↻ Check now", key="closed_refresh"):
             st.rerun()
-        # Stop here — don't login, don't fetch, don't render table
         return
-    # ═════════════════════════════════════════════════
 
+    # ── Load resources ────────────────────────────────
     obj    = load_api()
     stocks = load_stocks()
     symbols         = stocks["Symbol"].tolist()
     token_to_symbol = dict(zip(stocks["token"], stocks["Symbol"]))
     batches         = [stocks["token"].tolist()[i:i+BATCH_SIZE]
                        for i in range(0, len(symbols), BATCH_SIZE)]
-    init_state(symbols)
 
-    # ── Header row ────────────────────────────────────
+    # ── Shared state ──────────────────────────────────
+    shared = get_shared_state()
+    maybe_reset_day(shared, symbols)   # resets logs at start of new trading day
+    ensure_symbols(shared, symbols)    # idempotent — adds new symbols if any
+
+    # ── Header ────────────────────────────────────────
     c1, c2, c3 = st.columns([5, 3, 1])
     with c1:
         st.markdown(
             '<h2 style="font-family:JetBrains Mono,monospace;color:#FFD700;'
             'font-size:clamp(14px,3vw,20px);margin:0;letter-spacing:1px">'
-            '⚡ Momentum Radar v2 — NSE</h2>',
+            '⚡ SB Momentum Radar — NSE</h2>',
             unsafe_allow_html=True,
         )
-    tick    = st.session_state.tick
+    tick    = shared["tick"]
     warming = tick <= WARMUP_TICKS
     with c2:
+        ts_display = shared["last_ts"] or ist_now()
         if warming:
             st.warning(f"⏳ Warming {tick}/{WARMUP_TICKS} ({tick*REFRESH_SEC}s/{WARMUP_TICKS*REFRESH_SEC}s)")
         else:
-            st.success(f"🟢 Live — tick #{tick} · {st.session_state.last_ts.strftime('%H:%M:%S')}")
+            st.success(f"🟢 Live — tick #{tick} · {ts_display.strftime('%H:%M:%S')} IST")
     with c3:
         refresh_btn = st.button("↻ Refresh", use_container_width=True)
 
-    # ── Fetch & rank ──────────────────────────────────
-    ts = fetch_all(obj, batches, token_to_symbol)
-    st.session_state.tick   += 1
-    st.session_state.last_ts = ts
-    results = rank_stocks(symbols)
-    st.session_state.last_results = results
+    # ── Fetch (gated — only runs if due) ──────────────
+    fetched = fetch_if_due(obj, batches, token_to_symbol, shared)
+    if fetched:
+        shared["last_ts"] = ist_now()
+
+    # ── Rank ──────────────────────────────────────────
+    results = rank_stocks(symbols, shared)
+    shared["last_results"] = results
+
+    # ── Update spike logs ─────────────────────────────
+    update_spike_logs(results, shared)
 
     # ── HOF update ────────────────────────────────────
-    if st.session_state.tick > WARMUP_TICKS:
+    if shared["tick"] > WARMUP_TICKS:
         in_top3 = set()
         for i, r in enumerate(results[:3], 1):
-            st.session_state.top3_freq[r["sym"]]      += 1
-            st.session_state.top3_last_rank[r["sym"]]  = i
+            shared["top3_freq"][r["sym"]]      = shared["top3_freq"].get(r["sym"],0) + 1
+            shared["top3_last_rank"][r["sym"]] = i
             in_top3.add(r["sym"])
         for sym in symbols:
             if sym not in in_top3:
-                st.session_state.top3_last_rank[sym] = 0
+                shared["top3_last_rank"][sym] = 0
     for r in results:
-        st.session_state.hof_strength[r["sym"]] = {
+        shared["hof_strength"][r["sym"]] = {
             "score": round(r["score"],2), "signal": r["signal"],
             "sig_color": r["signal_color"], "z_spike": round(r["z_spike"],2),
             "ratio": round(r["ratio"],1), "roc": r["roc"],
             "candle_dir": r["candle_dir"], "price": r["price"],
             "up_ticks": r["up_ticks"],
         }
-    hof = sorted([(s, st.session_state.top3_freq[s]) for s in symbols
-                  if st.session_state.top3_freq[s] > 0],
-                 key=lambda x: x[1], reverse=True)[:10]
+    hof = sorted(
+        [(s, shared["top3_freq"].get(s,0)) for s in symbols if shared["top3_freq"].get(s,0) > 0],
+        key=lambda x: x[1], reverse=True
+    )[:10]
 
     # ── Summary metric cards ──────────────────────────
     st.divider()
@@ -1148,22 +1257,22 @@ def main():
 
     st.divider()
 
-    # ── 4 summary counters ────────────────────────────
+    # ── Summary counters ──────────────────────────────
     sb = [r for r in results if "STRONG BUY" in r["signal"]]
     wa = [r for r in results if "WATCH"      in r["signal"]]
     di = [r for r in results if "DIST"       in r["signal"]]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📊 Passed Gates", len(results))
-    m2.metric("🟢 Strong Buys",  len(sb))
-    m3.metric("🔷 Watch",        len(wa))
-    m4.metric("🔴 Distribution", len(di))
+    m1.metric("📊 Passed Gates",  len(results))
+    m2.metric("🟢 Strong Buys",   len(sb))
+    m3.metric("🔷 Watch",         len(wa))
+    m4.metric("🔴 Distribution",  len(di))
 
     st.divider()
 
-    # ── Full HTML component ───────────────────────────
-    import streamlit.components.v1 as components
+    # ── Live radar table ──────────────────────────────
     if results:
-        html_content = build_html(results, ts, tick, hof, warming)
+        html_content = build_html(results, shared["last_ts"] or ist_now(),
+                                  shared["tick"], hof, warming)
         row_h  = 46
         extras = 380
         height = min(920, extras + len(results) * row_h)
@@ -1173,9 +1282,25 @@ def main():
             '<div style="background:#0e0e18;border:1px solid #1e1e2e;border-radius:10px;'
             'padding:32px;text-align:center;color:#444;font-family:JetBrains Mono,monospace">'
             '⏳ No stocks have passed all 4 hard gates yet.<br>'
-            '<span style="font-size:12px;color:#333">Baseline data building — check back in ~60s</span></div>',
+            '<span style="font-size:12px;color:#333">Baseline building — check back in ~60s</span></div>',
             unsafe_allow_html=True,
         )
+
+    # ── Spike log ─────────────────────────────────────
+    st.divider()
+    sb_count  = len(shared["strong_buy_log"])
+    all_count = len(shared["signal_log"])
+    st.markdown(
+        f'<div style="font-family:JetBrains Mono,monospace;color:#FFD700;'
+        f'font-size:13px;font-weight:700;margin-bottom:4px">'
+        f'📋 Today\'s Spike History &nbsp;'
+        f'<span style="color:#00e676;font-size:11px">🟢 {sb_count} Strong Buys</span> &nbsp;'
+        f'<span style="color:#4fc3f7;font-size:11px">📊 {all_count} Total</span></div>',
+        unsafe_allow_html=True,
+    )
+    log_html   = build_spike_log_html(shared["signal_log"], shared["strong_buy_log"])
+    log_height = min(600, max(180, 110 + min(all_count, 15) * 32))
+    components.html(log_html, height=log_height, scrolling=True)
 
     # ── Manual refresh ────────────────────────────────
     if refresh_btn:
